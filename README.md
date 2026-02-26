@@ -1,6 +1,6 @@
 # Literasi Syariah LMS — API Documentation
 
-**Base URL:** `https://<project-region>-<project-id>.cloudfunctions.net/api`  
+**Base URL:** `https://api-gohgnhhszq-uc.a.run.app`  
 **API Version:** `v1`  
 **Content-Type:** `application/json`
 

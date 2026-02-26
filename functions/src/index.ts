@@ -11,7 +11,6 @@ import quizzesRouter from "./routes/quizzes.js";
 import enrollmentsRouter from "./routes/enrollments.js";
 import progressRouter from "./routes/progress.js";
 import storageRouter from "./routes/storage.js";
-import chatbotRouter from "./routes/chatbot.js";
 import leaderboardRouter from "./routes/leaderboard.js";
 
 setGlobalOptions({maxInstances: 10});
@@ -39,7 +38,6 @@ app.use("/v1/courses/:courseId/quizzes", quizzesRouter);
 app.use("/v1/enrollments", enrollmentsRouter);
 app.use("/v1/progress", progressRouter);
 app.use("/v1/storage", storageRouter);
-app.use("/v1/chatbot", chatbotRouter);
 app.use("/v1/leaderboard", leaderboardRouter);
 
 export const api = onRequest(

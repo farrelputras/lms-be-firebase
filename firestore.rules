@@ -65,17 +65,5 @@ service cloud.firestore {
       allow update, delete: if isAdmin();
     }
 
-    // Chat History — own data only
-    match /chatHistory/{uid} {
-      allow read, write: if isOwner(uid);
-
-      match /sessions/{sessionId} {
-        allow read, write: if isOwner(uid);
-
-        match /messages/{messageId} {
-          allow read, write: if isOwner(uid);
-        }
-      }
-    }
   }
 }

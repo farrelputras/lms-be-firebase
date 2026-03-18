@@ -12,8 +12,22 @@ router.use(verifyToken);
 // POST /enrollments — enroll in a course
 router.post("/", async (req, res) => {
   try {
-    const {courseId} = req.body as {courseId?: string};
-    const uid = req.user!.uid;
+    const {courseId, userId} = req.body as {
+      courseId?: string;
+      userId?: string;
+    };
+    const callerUid = req.user!.uid;
+
+    if (userId && req.user!.role !== "admin") {
+      res.status(403).json(
+        error("FORBIDDEN", "Only admin can enroll another user")
+      );
+      return;
+    }
+
+    const targetUserId = userId && req.user!.role === "admin" ?
+      userId :
+      callerUid;
 
     if (!courseId) {
       res.status(400).json(
@@ -33,7 +47,7 @@ router.post("/", async (req, res) => {
     // Check duplicate enrollment
     const existing = await adminDb
       .collection("enrollments")
-      .where("userId", "==", uid)
+      .where("userId", "==", targetUserId)
       .where("courseId", "==", courseId)
       .limit(1)
       .get();
@@ -46,7 +60,7 @@ router.post("/", async (req, res) => {
     }
 
     const enrollmentData = {
-      userId: uid,
+      userId: targetUserId,
       courseId,
       enrolledAt: FieldValue.serverTimestamp(),
     };
@@ -54,7 +68,15 @@ router.post("/", async (req, res) => {
     const docRef = await adminDb
       .collection("enrollments").add(enrollmentData);
     res.status(201).json(success({id: docRef.id, ...enrollmentData}));
-  } catch {
+  } catch (err: unknown) {
+    console.error({
+      route: "POST /enrollments",
+      uid: req.user?.uid,
+      courseId: (req.body as {courseId?: string})?.courseId,
+      userId: (req.body as {userId?: string})?.userId,
+      errorMessage: err instanceof Error ? err.message : String(err),
+      error: err,
+    });
     res.status(500).json(
       error("ENROLL_FAILED", "Failed to enroll")
     );
@@ -78,7 +100,13 @@ router.get("/my", async (req, res) => {
     }));
 
     res.json(success(enrollments));
-  } catch {
+  } catch (err: unknown) {
+    console.error({
+      route: "GET /enrollments/my",
+      uid: req.user?.uid,
+      errorMessage: err instanceof Error ? err.message : String(err),
+      error: err,
+    });
     res.status(500).json(
       error("FETCH_FAILED", "Failed to fetch enrollments")
     );
@@ -99,7 +127,14 @@ router.get("/:courseId/status", async (req, res) => {
       .get();
 
     res.json(success({enrolled: !snapshot.empty}));
-  } catch {
+  } catch (err: unknown) {
+    console.error({
+      route: "GET /enrollments/:courseId/status",
+      uid: req.user?.uid,
+      courseId: req.params.courseId,
+      errorMessage: err instanceof Error ? err.message : String(err),
+      error: err,
+    });
     res.status(500).json(
       error("FETCH_FAILED", "Failed to check enrollment status")
     );

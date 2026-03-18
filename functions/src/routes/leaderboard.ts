@@ -10,6 +10,7 @@ router.get("/", async (_req, res) => {
   try {
     const snapshot = await adminDb
       .collection("users")
+      .where("isActive", "==", true)
       .orderBy("totalPoints", "desc")
       .get();
 
@@ -21,6 +22,7 @@ router.get("/", async (_req, res) => {
           (data.displayName as string) || "",
         totalPoints:
           typeof data.totalPoints === "number" ? data.totalPoints : 0,
+        badges: Array.isArray(data.badges) ? data.badges : [],
       };
     });
 

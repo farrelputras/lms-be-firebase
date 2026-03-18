@@ -76,11 +76,12 @@ router.post(
   async (req, res) => {
     try {
       const courseId = req.params.courseId as string;
-      const {title, content, videoUrl, order} = req.body as {
+      const {title, content, videoUrl, order, isPublished} = req.body as {
         title?: string;
         content?: string;
         videoUrl?: string;
         order?: number;
+        isPublished?: boolean;
       };
 
       if (!title) {
@@ -95,6 +96,7 @@ router.post(
         content: content || "",
         videoUrl: videoUrl || "",
         order: order ?? 0,
+        isPublished: isPublished ?? false,
         createdAt: FieldValue.serverTimestamp(),
       };
 
@@ -122,11 +124,12 @@ router.patch(
     try {
       const courseId = req.params.courseId as string;
       const chapterId = req.params.chapterId as string;
-      const {title, content, videoUrl, order} = req.body as {
+      const {title, content, videoUrl, order, isPublished} = req.body as {
         title?: string;
         content?: string;
         videoUrl?: string;
         order?: number;
+        isPublished?: boolean;
       };
 
       const updates: Record<string, unknown> = {};
@@ -134,6 +137,7 @@ router.patch(
       if (content !== undefined) updates.content = content;
       if (videoUrl !== undefined) updates.videoUrl = videoUrl;
       if (order !== undefined) updates.order = order;
+      if (isPublished !== undefined) updates.isPublished = isPublished;
 
       await adminDb
         .collection("courses")

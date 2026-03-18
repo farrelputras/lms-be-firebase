@@ -1,3 +1,4 @@
+import "dotenv/config";
 import cors from "cors";
 import express from "express";
 import {onRequest} from "firebase-functions/v2/https";
@@ -36,7 +37,7 @@ app.use("/v1/courses", coursesRouter);
 app.use("/v1/courses/:courseId/chapters", chaptersRouter);
 app.use("/v1/courses/:courseId/quizzes", quizzesRouter);
 app.use("/v1/enrollments", enrollmentsRouter);
-app.use("/v1/progress", progressRouter);
+app.use("/v1/courses/:courseId/progress", progressRouter);
 app.use("/v1/storage", storageRouter);
 app.use("/v1/leaderboard", leaderboardRouter);
 

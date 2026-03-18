@@ -108,9 +108,17 @@ router.get("/me", verifyToken, async (req, res) => {
       return;
     }
 
+    const profile = normalizeFirestoreData(
+      docSnap.data()
+    ) as Record<string, unknown>;
+
     res.json(success({
       uid: docSnap.id,
-      ...(normalizeFirestoreData(docSnap.data()) as Record<string, unknown>),
+      ...profile,
+      totalPoints: profile.totalPoints === undefined ?
+        0 :
+        profile.totalPoints,
+      badges: profile.badges === undefined ? [] : profile.badges,
     }));
   } catch {
     res.status(500).json(

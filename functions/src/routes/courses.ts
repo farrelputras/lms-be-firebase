@@ -29,13 +29,19 @@ router.get("/", optionalAuth, async (req, res) => {
   }
 });
 
-// GET /courses/:courseId — public
-router.get("/:courseId", async (req, res) => {
+// GET /courses/:courseId — public (unpublished visible to admin only)
+router.get("/:courseId", optionalAuth, async (req, res) => {
   try {
-    const {courseId} = req.params;
+    const courseId = req.params.courseId as string;
     const docSnap = await adminDb.collection("courses").doc(courseId).get();
 
     if (!docSnap.exists) {
+      res.status(404).json(error("NOT_FOUND", "Course not found"));
+      return;
+    }
+
+    const courseData = docSnap.data() as {isPublished?: boolean};
+    if (req.user?.role !== "admin" && courseData.isPublished === false) {
       res.status(404).json(error("NOT_FOUND", "Course not found"));
       return;
     }

@@ -5,13 +5,32 @@ import {adminDb, normalizeFirestoreData} from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
 import {checkEnrollment} from "../middleware/checkEnrollment.js";
+import {checkAndAwardBadges} from "../utils/badges.js";
 import {success, error} from "../utils/response.js";
 
 interface QuizQuestion {
   question: string;
   options: string[];
-  correctAnswer: number;
+  correctAnswerIndex: number;
 }
+
+interface StudentQuizQuestion {
+  question: string;
+  options: string[];
+}
+
+const toStudentQuestions = (questions: unknown): StudentQuizQuestion[] => {
+  if (!Array.isArray(questions)) {
+    return [];
+  }
+
+  return questions.map((q) => ({
+    question: ((q as Record<string, unknown>).questionText as string) || "",
+    options: Array.isArray((q as Record<string, unknown>).options) ?
+      ((q as Record<string, unknown>).options as string[]) :
+      [],
+  }));
+};
 
 const router = Router({mergeParams: true});
 
@@ -32,17 +51,20 @@ router.get("/", verifyToken, checkEnrollment, async (req, res) => {
 
       // Strip correct answers for non-admin users
       if (req.user?.role !== "admin") {
-        const qs = (data.questions as QuizQuestion[]) || [];
-        data.questions = qs.map(({question, options}) => ({
-          question,
-          options,
-        }));
+        data.questions = toStudentQuestions(data.questions);
       }
       return {id: docSnap.id, ...data};
     });
 
     res.json(success(quizzes));
-  } catch {
+  } catch (err: unknown) {
+    console.error({
+      route: "GET /courses/:courseId/quizzes",
+      uid: req.user?.uid,
+      courseId: req.params.courseId,
+      errorMessage: err instanceof Error ? err.message : String(err),
+      error: err,
+    });
     res.status(500).json(
       error("FETCH_FAILED", "Failed to fetch quizzes")
     );
@@ -76,15 +98,19 @@ router.get(
 
       // Strip correct answers for non-admin users
       if (req.user?.role !== "admin") {
-        const qs = (data.questions as QuizQuestion[]) || [];
-        data.questions = qs.map(({question, options}) => ({
-          question,
-          options,
-        }));
+        data.questions = toStudentQuestions(data.questions);
       }
 
       res.json(success({id: docSnap.id, ...data}));
-    } catch {
+    } catch (err: unknown) {
+      console.error({
+        route: "GET /courses/:courseId/quizzes/:quizId",
+        uid: req.user?.uid,
+        courseId: req.params.courseId,
+        quizId: req.params.quizId,
+        errorMessage: err instanceof Error ? err.message : String(err),
+        error: err,
+      });
       res.status(500).json(
         error("FETCH_FAILED", "Failed to fetch quiz")
       );
@@ -126,7 +152,14 @@ router.post(
         .add(quizData);
 
       res.status(201).json(success({id: docRef.id, ...quizData}));
-    } catch {
+    } catch (err: unknown) {
+      console.error({
+        route: "POST /courses/:courseId/quizzes",
+        uid: req.user?.uid,
+        courseId: req.params.courseId,
+        errorMessage: err instanceof Error ? err.message : String(err),
+        error: err,
+      });
       res.status(500).json(
         error("CREATE_FAILED", "Failed to create quiz")
       );
@@ -174,7 +207,15 @@ router.patch(
           string, unknown
         >),
       }));
-    } catch {
+    } catch (err: unknown) {
+      console.error({
+        route: "PATCH /courses/:courseId/quizzes/:quizId",
+        uid: req.user?.uid,
+        courseId: req.params.courseId,
+        quizId: req.params.quizId,
+        errorMessage: err instanceof Error ? err.message : String(err),
+        error: err,
+      });
       res.status(500).json(
         error("UPDATE_FAILED", "Failed to update quiz")
       );
@@ -199,7 +240,15 @@ router.delete(
         .delete();
 
       res.json(success({id: quizId, deleted: true}));
-    } catch {
+    } catch (err: unknown) {
+      console.error({
+        route: "DELETE /courses/:courseId/quizzes/:quizId",
+        uid: req.user?.uid,
+        courseId: req.params.courseId,
+        quizId: req.params.quizId,
+        errorMessage: err instanceof Error ? err.message : String(err),
+        error: err,
+      });
       res.status(500).json(
         error("DELETE_FAILED", "Failed to delete quiz")
       );
@@ -252,35 +301,61 @@ router.post(
 
       let correctCount = 0;
       questions.forEach((q, i) => {
-        if (q.correctAnswer === answers[i]) correctCount++;
+        if (q.correctAnswerIndex === answers[i]) correctCount++;
       });
 
-      const score = Math.round(
-        (correctCount / questions.length) * 100
-      );
+      const totalQuestions = questions.length;
       const uid = req.user!.uid;
+
+      await adminDb.collection("users").doc(uid).set({
+        totalPoints: FieldValue.increment(correctCount),
+      }, {merge: true});
+
+      const badges = await checkAndAwardBadges(uid, adminDb, {
+        type: "quiz_submit",
+        correctCount,
+        totalQuestions,
+      });
+
+      const answerSummary = questions.map((q, i) => ({
+        questionId: ((q as unknown as Record<string, unknown>).id as string) ||
+          String(i),
+        correct: q.correctAnswerIndex === answers[i],
+      }));
 
       const resultData = {
         userId: uid,
         courseId,
         quizId,
         answers,
-        score,
+        score: Math.round((correctCount / totalQuestions) * 100),
         correctCount,
-        totalQuestions: questions.length,
+        totalQuestions,
+        pointsAwarded: correctCount,
         submittedAt: FieldValue.serverTimestamp(),
       };
 
-      const resultRef = await adminDb
-        .collection("quizResults")
+      await adminDb
+        .collection("quiz_results")
         .add(resultData);
 
       res.json(success({
-        id: resultRef.id,
-        ...resultData,
-        submittedAt: null,
+        score: correctCount,
+        total: totalQuestions,
+        passed: correctCount === totalQuestions,
+        pointsAwarded: correctCount,
+        badges,
+        answers: answerSummary,
       }));
-    } catch {
+    } catch (err: unknown) {
+      console.error({
+        route: "POST /courses/:courseId/quizzes/:quizId/submit",
+        uid: req.user?.uid,
+        courseId: req.params.courseId,
+        quizId: req.params.quizId,
+        errorMessage: err instanceof Error ? err.message : String(err),
+        error: err,
+      });
       res.status(500).json(
         error("SUBMIT_FAILED", "Failed to submit quiz")
       );

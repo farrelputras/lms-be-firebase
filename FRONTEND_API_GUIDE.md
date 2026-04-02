@@ -3,7 +3,7 @@
 This guide is written for frontend developers (web or mobile) consuming the LMS Literasi Syariah backend API. It focuses entirely on **how to call the API correctly** — what to send, what you get back, and what to watch out for. You do not need to know how the backend is structured internally to use this guide.
 
 **Base URL (local emulator):** `http://127.0.0.1:5001/literasi-ekonomi-syariah/us-central1/api`  
-**Base URL (production):** `https://<region>-literasi-ekonomi-syariah.cloudfunctions.net/api`  
+**Base URL (production):** `https://api-gohgnhhszq-uc.a.run.app`  
 **All routes are prefixed with:** `/v1`  
 **All requests and responses use:** `application/json`
 

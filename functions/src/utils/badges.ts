@@ -8,6 +8,17 @@ type BadgeEvent =
   }
   | {
     type: "points_update";
+  }
+  | {
+    type: "activity_submitted";
+    activityType: string;
+    earnedPoints: number;
+    maxPoints: number;
+  }
+  | {
+    type: "activity_perfect";
+    activityType: string;
+    maxPoints: number;
   };
 
 export const checkAndAwardBadges = async (
@@ -15,6 +26,16 @@ export const checkAndAwardBadges = async (
   db: Firestore,
   event: BadgeEvent
 ): Promise<string[]> => {
+  if (event.type === "activity_submitted") {
+    // TODO: implement activity submission badge rules
+    return [];
+  }
+
+  if (event.type === "activity_perfect") {
+    // TODO: implement perfect score badge rules
+    return [];
+  }
+
   const userRef = db.collection("users").doc(uid);
   const userSnap = await userRef.get();
 

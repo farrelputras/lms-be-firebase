@@ -30,5 +30,6 @@ module.exports = {
     "import/no-unresolved": 0,
     "indent": ["error", 2],
     "new-cap": ["error", {"capIsNewExceptions": ["Router"]}],
+    "max-len": ["error", {"code": 120}],
   },
 };

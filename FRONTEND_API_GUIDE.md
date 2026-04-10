@@ -18,6 +18,8 @@ This guide is written for frontend developers (web or mobile) consuming the LMS 
 - [Course Endpoints](#course-endpoints)
 - [Chapter Endpoints](#chapter-endpoints)
 - [Quiz Endpoints](#quiz-endpoints)
+- [Activity Endpoints](#activity-endpoints)
+- [Course Content Endpoint](#course-content-endpoint)
 - [Progress Endpoints](#progress-endpoints)
 - [Enrollment Endpoints](#enrollment-endpoints)
 - [Leaderboard Endpoint](#leaderboard-endpoint)
@@ -120,6 +122,7 @@ The following error codes appear across multiple endpoints. Each endpoint sectio
 | `400` | `BAD_REQUEST` | You sent a missing or invalid field. Check the request body. |
 | `401` | `UNAUTHORIZED` | Token is missing, expired, or invalid. Refresh the token and retry. |
 | `403` | `FORBIDDEN` | The user is authenticated but does not have permission. Show an access denied message. |
+| `403` | `LOCKED` | The activity is locked because the previous item has not been completed. Show a "complete previous item" prompt — this is distinct from a permission error. |
 | `404` | `NOT_FOUND` | The resource does not exist, or is hidden for access control reasons (e.g. unpublished course). |
 | `500` | `*_FAILED` | Something went wrong on the server. Log the error and show a generic retry message. |
 
@@ -295,6 +298,205 @@ After receiving a submit response, call `GET /auth/me` to refresh the user's ful
 
 ---
 
+## Activity Endpoints
+
+All activity routes are nested under `/v1/courses/:courseId/activities`. Student requests require enrollment. Activities are stored in the `gamification` subcollection under a course document.
+
+There are three activity types: `drag_drop`, `word_search`, and `true_or_false`. The type is fixed at creation and cannot be changed via update.
+
+### Create an activity — `POST /v1/courses/:courseId/activities` *(admin only)*
+
+All activity types share four common required fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | string | `drag_drop`, `word_search`, or `true_or_false` |
+| `title` | string | Display name shown to students |
+| `position` | number | Sort order in the course content sequence |
+| `maxPoints` | number | Maximum points a student can earn |
+
+Each type then requires its own additional fields:
+
+**`drag_drop`**
+```json
+{
+  "type": "drag_drop",
+  "title": "Kategorikan Instrumen Keuangan Syariah",
+  "position": 2,
+  "maxPoints": 10,
+  "categories": ["Sosial", "Komersial"],
+  "items": [
+    { "id": "item1", "label": "Zakat", "correctCategory": "Sosial" },
+    { "id": "item2", "label": "Mudharabah", "correctCategory": "Komersial" }
+  ],
+  "feedbackMode": "immediate"
+}
+```
+
+**`word_search`**
+```json
+{
+  "type": "word_search",
+  "title": "Temukan Istilah Ekonomi Syariah",
+  "position": 3,
+  "maxPoints": 5,
+  "wordList": ["ZAKAT", "WAKAF", "RIBA"],
+  "gridSize": { "rows": 10, "cols": 10 }
+}
+```
+`gridSize` rows and cols must each be between 8 and 15 (inclusive).
+
+**`true_or_false`**
+```json
+{
+  "type": "true_or_false",
+  "title": "Benar atau Salah: Konsep Dasar",
+  "position": 4,
+  "maxPoints": 6,
+  "statements": [
+    { "id": "s1", "text": "Riba diperbolehkan dalam Islam.", "correct": false },
+    { "id": "s2", "text": "Zakat termasuk rukun Islam.", "correct": true }
+  ],
+  "feedbackMode": "immediate"
+}
+```
+
+Response on success: `{ "activityId": "<newId>" }` with HTTP 201.
+
+### Get an activity — `GET /v1/courses/:courseId/activities/:activityId`
+
+Returns the activity. Requires enrollment. **Correct answer data is stripped for students** — the same pattern as quizzes:
+- `drag_drop`: each item returns only `{ id, label }` — `correctCategory` is removed
+- `true_or_false`: each statement returns only `{ id, text }` — `correct` is removed
+- `word_search`: full data is returned (no answers to strip)
+
+Admins receive the full stored shape including `correctCategory` / `correct` values.
+
+**Locking:** If the activity's `position` is greater than 0 and the student has not yet completed the previous item in the sequence (either a chapter or another activity), the endpoint returns `403` with code `LOCKED`:
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "LOCKED",
+    "message": "This activity is locked. Complete the previous item first."
+  }
+}
+```
+
+Exception: if the student has already completed the activity in a prior session, it is always accessible regardless of whether the previous item is completed.
+
+### Submit activity answers — `POST /v1/courses/:courseId/activities/:activityId/submit`
+
+The answer format differs by activity type.
+
+**`drag_drop`** — a plain object mapping each item ID to the selected category string:
+```json
+{ "answers": { "item1": "Sosial", "item2": "Komersial" } }
+```
+
+**`word_search`** — an object with a `foundWords` string array (case-insensitive):
+```json
+{ "answers": { "foundWords": ["ZAKAT", "WAKAF"] } }
+```
+
+**`true_or_false`** — a plain object mapping each statement ID to a boolean:
+```json
+{ "answers": { "s1": false, "s2": true } }
+```
+
+```json
+// Response
+{
+  "success": true,
+  "data": {
+    "score": 2,
+    "maxPoints": 10,
+    "scorePercent": 100,
+    "earnedPoints": 10,
+    "pointsEarned": 10,
+    "isNewCompletion": true,
+    "badges": [],
+    "feedback": [
+      { "id": "item1", "correct": true, "correctCategory": "Sosial" },
+      { "id": "item2", "correct": true, "correctCategory": "Komersial" }
+    ]
+  }
+}
+```
+
+**`score`** is the raw correct count. **`earnedPoints`** is the proportional points scored this attempt (`Math.round(score / total * maxPoints)`). **`pointsEarned`** is the delta actually added to `totalPoints` — only the improvement over the student's previous best score is credited. On a first attempt these two fields are equal; on a retake where the student scored lower than before, `pointsEarned` will be `0`.
+
+`isNewCompletion` is `true` on the first submission only. Use it to decide whether to trigger a course-progress animation. The activity is marked `completed: true` on the first submission and stays that way regardless of future scores.
+
+`feedback` shape differs by type:
+- `drag_drop`: `[{ id, correct, correctCategory }]`
+- `word_search`: `[{ word, found }]`
+- `true_or_false`: `[{ id, correct, correctAnswer }]`
+
+After receiving a submit response, call `GET /auth/me` to refresh the user's cumulative `totalPoints`.
+
+### Update an activity — `PUT /v1/courses/:courseId/activities/:activityId` *(admin only)*
+
+Partial update. Only include fields you want to change. The activity `type` cannot be changed. Type-specific fields are only accepted if they match the stored type — sending `wordList` to a `drag_drop` activity has no effect.
+
+### Delete an activity — `DELETE /v1/courses/:courseId/activities/:activityId` *(admin only)*
+
+Deletes the activity and **cascades**: all `activityProgress` documents for that activity are deleted in the same batch.
+
+---
+
+## Course Content Endpoint
+
+### Get course content — `GET /v1/courses/:courseId/content`
+
+Returns a unified, ordered list of all chapters and activities for a course. Requires enrollment. This is the primary endpoint for rendering the course sidebar or table of contents — it replaces calling `GET /chapters` and `GET /activities` separately.
+
+Each item in the array includes `itemType` (`"chapter"` or `"activity"`), `completed`, and `locked` fields in addition to the item's own data. Items are sorted by `position` ascending. Activities with sensitive fields (`correctCategory`, `correct`) are already stripped in this response.
+
+```json
+// Response (abbreviated)
+{
+  "success": true,
+  "data": [
+    {
+      "itemType": "chapter",
+      "id": "chapterAbc",
+      "title": "Pengantar Ekonomi Syariah",
+      "position": 1,
+      "completed": true,
+      "locked": false
+    },
+    {
+      "itemType": "activity",
+      "id": "activityXyz",
+      "type": "drag_drop",
+      "title": "Kategorikan Instrumen",
+      "position": 2,
+      "completed": false,
+      "locked": false,
+      "bestScorePercent": 80,
+      "attempts": 2
+    },
+    {
+      "itemType": "activity",
+      "id": "activityWww",
+      "type": "word_search",
+      "title": "Temukan Istilah",
+      "position": 3,
+      "completed": false,
+      "locked": true
+    }
+  ]
+}
+```
+
+**`locked`** is `true` when the immediately preceding item has not been completed. The first item is never locked. **`bestScorePercent`** and **`attempts`** are only present on activity items and only when the student has at least one prior submission.
+
+Admins always receive `locked: false` for every item, regardless of their own progress.
+
+---
+
 ## Progress Endpoints
 
 ### Mark a chapter complete — `POST /v1/courses/:courseId/progress`
@@ -388,11 +590,16 @@ Returns a signed read URL valid for 1 hour. The `:fileId` is the file path in Cl
 
 Understanding the gamification system helps you build the right UI reactions at the right moments.
 
-**Points** come from two sources. Chapter completion awards `+10 points` the first time a chapter is completed, and `0` on repeat completions — so you only show the animation when `pointsAwarded > 0` in the response. Quiz submission awards `+1 point per correct answer` on every submission including retakes, so `pointsAwarded` will always be greater than zero as long as the student got at least one answer right.
+**Points** come from three sources:
+- **Chapter completion** — `+10 points` on the first completion only. `pointsAwarded` is `0` on re-completions.
+- **Quiz submission** — `+1 point per correct answer` on every submission including retakes.
+- **Activity submission** — proportional points based on score vs `maxPoints`. Only the *improvement* over the student's previous best is credited to `totalPoints`. The response field `pointsEarned` is this delta; `earnedPoints` is the raw points scored this attempt.
 
 **Badges** are strings stored in an array on the user profile. There are currently two badges. The `perfect_score` badge is awarded when a quiz submission has `passed: true` (100% score). The `top_3` badge is awarded when the user's `totalPoints` rank is within the top 3 on the leaderboard after any point increment. Both badges are idempotent — they are awarded exactly once and never duplicated, so you can safely check for their presence in `users.badges` without worrying about counting duplicates.
 
-The recommended UI pattern for gamification feedback is to read `pointsAwarded` and `badges` from the immediate response to drive the animation or modal, then call `GET /auth/me` in the background to refresh the global user state so the header or profile page shows the updated totals.
+Activity submissions also invoke badge checks via `activity_submitted` and `activity_perfect` events — these badge rules are not yet implemented but will be added without changing the response shape.
+
+The recommended UI pattern for gamification feedback is to read the points and `badges` fields from the immediate response to drive the animation or modal, then call `GET /auth/me` in the background to refresh the global user state so the header or profile page shows the updated totals.
 
 ---
 
@@ -409,3 +616,11 @@ These are subtle behaviours that are easy to miss and hard to debug once you hit
 **`GET /auth/me` after gamification actions.** The submit and progress responses return `pointsAwarded` and `badges` for the immediate action, but they do not return the updated `totalPoints` cumulative value. Call `GET /auth/me` after these actions to get the updated total for display in the header or profile.
 
 **Unpublished courses return `404`, not `403`.** If you are building an admin preview feature where an admin views an unpublished course as a student would, be aware that the non-admin path returns `404` for unpublished content — there is no way to distinguish "course does not exist" from "course exists but is unpublished" from the non-admin perspective. Use an admin token if the admin needs to preview unpublished content.
+
+**Activity answer format is not uniform.** Unlike quiz answers (a flat integer array), each activity type has a different answer shape. `drag_drop` expects `{ "answers": { "<itemId>": "<category>" } }`. `word_search` expects `{ "answers": { "foundWords": ["WORD1", "WORD2"] } }`. `true_or_false` expects `{ "answers": { "<statementId>": true/false } }`. Sending the wrong shape will silently score every answer as incorrect.
+
+**`pointsEarned` vs `earnedPoints` in activity submit.** The response contains both fields. `earnedPoints` is the points the student scored this attempt. `pointsEarned` is the delta actually added to `totalPoints` — only the improvement over their previous best. On a retake where the score dropped, `pointsEarned` is `0` even though `earnedPoints` is positive. Use `pointsEarned` to decide whether to show a "+N points" animation.
+
+**Locked activities return `403 LOCKED`, not `403 FORBIDDEN`.** The error code is `LOCKED` rather than `FORBIDDEN`. Handle this separately in your UI — a locked activity should show a "complete the previous item first" prompt, not a generic access-denied message.
+
+**`drag_drop` and `true_or_false` strip correct answers on GET, same as quizzes.** When a student fetches an activity, `correctCategory` is removed from drag-drop items and `correct` is removed from true-or-false statements. The full shape is only visible to admins. Don't rely on the GET response to pre-populate correct answers on the frontend.

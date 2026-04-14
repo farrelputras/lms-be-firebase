@@ -306,7 +306,7 @@ router.get(
       const position =
         typeof activityData.position === "number" ? activityData.position : 0;
       const currentActivityProgressSnap = await adminDb
-        .collection("activityProgress")
+        .collection("activity_progress")
         .doc(`${uid}_${activityId}`)
         .get();
       const currentActivityCompleted =
@@ -362,7 +362,7 @@ router.get(
             prevCompleted = completedChapters.includes(prev.id);
           } else {
             const apSnap = await adminDb
-              .collection("activityProgress")
+              .collection("activity_progress")
               .doc(`${uid}_${prev.id}`)
               .get();
             prevCompleted = (apSnap.data()?.completed as boolean) ?? false;
@@ -503,7 +503,7 @@ router.post(
         totalCount > 0 ? Math.round((correctCount / totalCount) * 100) : 0;
 
       const progressDocId = `${uid}_${activityId}`;
-      const progressRef = adminDb.collection("activityProgress").doc(progressDocId);
+      const progressRef = adminDb.collection("activity_progress").doc(progressDocId);
       const progressSnap = await progressRef.get();
       const previousBestPoints: number = progressSnap.exists ?
         ((progressSnap.data()?.bestScore as number) ?? 0) :
@@ -689,7 +689,7 @@ router.delete(
       batch.delete(activityRef);
 
       const progressSnap = await adminDb
-        .collection("activityProgress")
+        .collection("activity_progress")
         .where("activityId", "==", activityId)
         .get();
 

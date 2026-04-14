@@ -133,17 +133,17 @@ router.get("/", verifyToken, checkEnrollment, async (req, res) => {
       (a, b) => a.position - b.position
     );
 
-    const [progressSnap, activityProgressSnaps] = await Promise.all([
+    const [progressSnap, activity_progressSnaps] = await Promise.all([
       adminDb.collection("progress").doc(`${uid}_${courseId}`).get(),
-      adminDb.collection("activityProgress").where("userId", "==", uid).get(),
+      adminDb.collection("activity_progress").where("userId", "==", uid).get(),
     ]);
 
     const completedChapters: string[] = progressSnap.exists ?
       ((progressSnap.data()?.completedChapters as string[]) || []) :
       [];
 
-    const activityProgressMap = new Map<string, ProgressSummary>();
-    activityProgressSnaps.docs.forEach((docSnap) => {
+    const activity_progressMap = new Map<string, ProgressSummary>();
+    activity_progressSnaps.docs.forEach((docSnap) => {
       const data = normalizeFirestoreData(
         docSnap.data()
       ) as Record<string, unknown>;
@@ -157,14 +157,14 @@ router.get("/", verifyToken, checkEnrollment, async (req, res) => {
         return;
       }
 
-      const existing = activityProgressMap.get(activityId);
+      const existing = activity_progressMap.get(activityId);
       const completed = typeof data.completed === "boolean" ? data.completed : false;
       const bestScorePercent =
         typeof data.bestScorePercent === "number" ? data.bestScorePercent : undefined;
       const attempts = typeof data.attempts === "number" ? data.attempts : undefined;
 
       if (!existing) {
-        activityProgressMap.set(activityId, {
+        activity_progressMap.set(activityId, {
           completed,
           bestScorePercent,
           attempts,
@@ -172,7 +172,7 @@ router.get("/", verifyToken, checkEnrollment, async (req, res) => {
         return;
       }
 
-      activityProgressMap.set(activityId, {
+      activity_progressMap.set(activityId, {
         completed: existing.completed || completed,
         bestScorePercent: typeof bestScorePercent === "number" ?
           Math.max(existing.bestScorePercent ?? 0, bestScorePercent) :
@@ -188,14 +188,14 @@ router.get("/", verifyToken, checkEnrollment, async (req, res) => {
       if (item.itemType === "chapter") {
         completed = completedChapters.includes(item.id);
       } else {
-        completed = activityProgressMap.get(item.id)?.completed ?? false;
+        completed = activity_progressMap.get(item.id)?.completed ?? false;
       }
 
       const previous = index > 0 ? (items[index - 1] as ContentItem) : null;
       const previousCompleted = previous ?
         (previous.itemType === "chapter" ?
           completedChapters.includes(previous.id) :
-          (activityProgressMap.get(previous.id)?.completed ?? false)) :
+          (activity_progressMap.get(previous.id)?.completed ?? false)) :
         true;
 
       const locked = index === 0 ? false : !previousCompleted;
@@ -206,7 +206,7 @@ router.get("/", verifyToken, checkEnrollment, async (req, res) => {
       } as ContentItem;
 
       if (baseItem.itemType === "activity") {
-        const progress = activityProgressMap.get(baseItem.id);
+        const progress = activity_progressMap.get(baseItem.id);
         return {
           ...baseItem,
           ...(progress?.bestScorePercent !== undefined ?

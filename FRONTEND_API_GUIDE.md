@@ -20,7 +20,7 @@ This guide is written for frontend developers (web or mobile) consuming the LMS 
 - [Quiz Endpoints](#quiz-endpoints)
 - [Activity Endpoints](#activity-endpoints)
 - [Course Content Endpoint](#course-content-endpoint)
-- [Progress Endpoints](#progress-endpoints)
+- [Progress Endpoints](#progress-endpoints) — mark complete, get progress, reset (dev only)
 - [Enrollment Endpoints](#enrollment-endpoints)
 - [Leaderboard Endpoint](#leaderboard-endpoint)
 - [Storage Endpoints](#storage-endpoints)
@@ -442,7 +442,7 @@ Partial update. Only include fields you want to change. The activity `type` cann
 
 ### Delete an activity — `DELETE /v1/courses/:courseId/activities/:activityId` *(admin only)*
 
-Deletes the activity and **cascades**: all `activityProgress` documents for that activity are deleted in the same batch.
+Deletes the activity and **cascades**: all `activity_progress` documents for that activity are deleted in the same batch.
 
 ---
 
@@ -528,6 +528,31 @@ The `pointsAwarded` field is `10` on the first completion of a chapter and `0` o
 ### Get progress for a course — `GET /v1/courses/:courseId/progress`
 
 Returns the user's progress for a course. If the user has not completed any chapters yet, returns an empty default rather than a `404` — so this endpoint is always safe to call without checking enrollment first.
+
+### Reset all progress — `DELETE /v1/courses/:courseId/progress` *(dev/testing only)*
+
+Clears all of the calling user's progress for a course in one call. This endpoint exists only for development and testing — it is not available in production builds of the frontend.
+
+Deletes:
+- The `progress` document for this user+course (chapter completions and percentage)
+- All `quiz_results` documents for this user+course
+- All `activity_progress` documents for this user+course
+
+Points earned are **not** deducted.
+
+```json
+// Response
+{
+  "success": true,
+  "data": {
+    "deleted": true,
+    "quizResultsCleared": 2,
+    "activityProgressCleared": 1
+  }
+}
+```
+
+After a successful reset the page should be reloaded so that the sidebar and progress bar reflect the cleared state.
 
 ---
 

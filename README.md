@@ -2,7 +2,7 @@
 
 This guide is written for backend developers maintaining or extending the `lms-be-firebase` repository. It focuses on the internal architecture — how the request pipeline is assembled, why middleware is ordered the way it is, how the gamification system is wired, and where the known traps are. If you are a frontend developer looking for how to call the API, see `FRONTEND_API_GUIDE.md` instead.
 
-**Runtime:** Firebase Cloud Functions v2, Node.js 20, Express 5  
+**Runtime:** Firebase Cloud Functions v2, Node.js 22, Express 5  
 **Database:** Firestore via Admin SDK  
 **Storage:** Google Cloud Storage via Admin SDK  
 **Auth:** Firebase Authentication with custom claims  
@@ -45,6 +45,8 @@ lms-be-firebase/
 │   │   │   ├── courses.ts
 │   │   │   ├── chapters.ts
 │   │   │   ├── quizzes.ts
+│   │   │   ├── activities.ts
+│   │   │   ├── content.ts
 │   │   │   ├── enrollments.ts
 │   │   │   ├── progress.ts
 │   │   │   ├── storage.ts
@@ -156,16 +158,18 @@ Each route file exports an Express `Router` instance. Routers are mounted in `in
 The mounting tree in `index.ts` looks like this:
 
 ```
-/health                           → inline handler in index.ts
-/v1/auth                          → routes/auth.ts
-/v1/users                         → routes/users.ts       (router.use(verifyToken, requireRole('admin')))
-/v1/courses                       → routes/courses.ts
-/v1/courses/:courseId/chapters    → routes/chapters.ts    (mergeParams: true)
-/v1/courses/:courseId/quizzes     → routes/quizzes.ts     (mergeParams: true)
-/v1/enrollments                   → routes/enrollments.ts (router.use(verifyToken))
-/v1/courses/:courseId/progress    → routes/progress.ts    (mergeParams: true, router.use(verifyToken))
-/v1/storage                       → routes/storage.ts     (router.use(verifyToken))
-/v1/leaderboard                   → routes/leaderboard.ts
+/health                              → inline handler in index.ts
+/v1/auth                             → routes/auth.ts
+/v1/users                            → routes/users.ts       (router.use(verifyToken, requireRole('admin')))
+/v1/courses                          → routes/courses.ts
+/v1/courses/:courseId/chapters       → routes/chapters.ts    (mergeParams: true)
+/v1/courses/:courseId/quizzes        → routes/quizzes.ts     (mergeParams: true)
+/v1/courses/:courseId/activities     → routes/activities.ts  (mergeParams: true)
+/v1/courses/:courseId/content        → routes/content.ts     (mergeParams: true, requires enrollment)
+/v1/enrollments                      → routes/enrollments.ts (router.use(verifyToken))
+/v1/courses/:courseId/progress       → routes/progress.ts    (mergeParams: true, router.use(verifyToken))
+/v1/storage                          → routes/storage.ts     (router.use(verifyToken))
+/v1/leaderboard                      → routes/leaderboard.ts
 ```
 
 An important detail about the users router: it applies `verifyToken` and `requireRole('admin')` at the router level using `router.use(...)`. This means every route registered on that router — including routes added in the future — is automatically admin-protected without needing to specify it per route. This is the right pattern for route groups where every endpoint shares the same access requirements. For route groups with mixed access (like quizzes, where GET is enrolled-student and POST is admin), the middleware is applied per route instead.
@@ -193,6 +197,10 @@ All collections are at the Firestore root level except chapters and quizzes, whi
 **`progress/{uid_courseId}`** — The document ID is a composite key in the format `{uid}_{courseId}`. This makes progress lookups a single document read rather than a query, which is more efficient and predictable. The `completedChapters` field is an array of chapter ID strings.
 
 **`quiz_results/{resultId}`** — Auto-generated document ID. Stores the full result of a single quiz submission including `pointsAwarded`. Note: the collection name is `quiz_results` (snake_case). Historical documentation and Firestore security rules may reference `quizResults` (camelCase) — those references are stale and need to be updated.
+
+**`courses/{courseId}/gamification/{activityId}`** — Subcollection under each course for gamification activities (drag & drop, word search, true/false). The `type` field determines the activity variant and which type-specific fields are present. The `position` field determines ordering relative to chapters.
+
+**`activity_progress/{uid_activityId}`** — The document ID is a composite key in the format `{uid}_{activityId}`. Stores progress for gamification activities including `bestScore`, `bestScorePercent`, `attempts`, and `completed`.
 
 ---
 

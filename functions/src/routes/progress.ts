@@ -183,18 +183,31 @@ router.delete("/", checkEnrollment, async (req, res) => {
     // Delete progress document
     await adminDb.collection("progress").doc(progressId).delete();
 
-    // Query and delete quiz results for this user+course
-    const quizResultsSnap = await adminDb
-      .collection("quiz_results")
-      .where("userId", "==", uid)
-      .where("courseId", "==", courseId)
-      .get();
+    // Query quiz results and activity progress for this user+course
+    const [quizResultsSnap, activityProgressSnap] = await Promise.all([
+      adminDb
+        .collection("quiz_results")
+        .where("userId", "==", uid)
+        .where("courseId", "==", courseId)
+        .get(),
+      adminDb
+        .collection("activity_progress")
+        .where("userId", "==", uid)
+        .where("courseId", "==", courseId)
+        .get(),
+    ]);
 
     const quizResultsCleared = quizResultsSnap.size;
+    const activityProgressCleared = activityProgressSnap.size;
 
-    if (quizResultsCleared > 0) {
+    // Batch delete all related documents
+    const totalToDelete = quizResultsCleared + activityProgressCleared;
+    if (totalToDelete > 0) {
       const batch = adminDb.batch();
       quizResultsSnap.docs.forEach((doc) => {
+        batch.delete(doc.ref);
+      });
+      activityProgressSnap.docs.forEach((doc) => {
         batch.delete(doc.ref);
       });
       await batch.commit();
@@ -203,6 +216,7 @@ router.delete("/", checkEnrollment, async (req, res) => {
     res.json(success({
       deleted: true,
       quizResultsCleared,
+      activityProgressCleared,
     }));
   } catch (err: unknown) {
     console.error({

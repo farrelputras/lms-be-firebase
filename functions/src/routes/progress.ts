@@ -172,4 +172,50 @@ router.get("/", async (req, res) => {
   }
 });
 
+// DELETE /courses/:courseId/progress — reset progress for testing
+router.delete("/", checkEnrollment, async (req, res) => {
+  try {
+    const uid = req.user!.uid;
+    const {courseId} = req.params as {courseId: string};
+
+    const progressId = `${uid}_${courseId}`;
+
+    // Delete progress document
+    await adminDb.collection("progress").doc(progressId).delete();
+
+    // Query and delete quiz results for this user+course
+    const quizResultsSnap = await adminDb
+      .collection("quiz_results")
+      .where("userId", "==", uid)
+      .where("courseId", "==", courseId)
+      .get();
+
+    const quizResultsCleared = quizResultsSnap.size;
+
+    if (quizResultsCleared > 0) {
+      const batch = adminDb.batch();
+      quizResultsSnap.docs.forEach((doc) => {
+        batch.delete(doc.ref);
+      });
+      await batch.commit();
+    }
+
+    res.json(success({
+      deleted: true,
+      quizResultsCleared,
+    }));
+  } catch (err: unknown) {
+    console.error({
+      route: "DELETE /courses/:courseId/progress",
+      uid: req.user?.uid,
+      courseId: req.params.courseId,
+      errorMessage: err instanceof Error ? err.message : String(err),
+      error: err,
+    });
+    res.status(500).json(
+      error("RESET_FAILED", "Failed to reset progress")
+    );
+  }
+});
+
 export default router;

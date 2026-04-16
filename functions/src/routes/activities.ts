@@ -483,11 +483,20 @@ router.post(
         totalCount = statements.length;
         const submittedAnswers = answers as Record<string, boolean>;
 
-        for (const statement of statements) {
-          const isCorrect = submittedAnswers[statement.id] === statement.correct;
+        for (const [index, statement] of statements.entries()) {
+          const statementId =
+            typeof statement.id === "string" ? statement.id.trim() : "";
+          const fallbackKey = `__statement_${index}`;
+
+          // Backward compatibility for older activities created with empty statement IDs.
+          const submittedValue = statementId.length > 0 ?
+            submittedAnswers[statementId] :
+            submittedAnswers[fallbackKey];
+
+          const isCorrect = submittedValue === statement.correct;
           if (isCorrect) correctCount++;
           feedback.push({
-            id: statement.id,
+            id: statementId || fallbackKey,
             correct: isCorrect,
             correctAnswer: statement.correct,
           });

@@ -268,6 +268,33 @@ router.post("/", verifyToken, requireRole("admin"), async (req, res) => {
   }
 });
 
+// GET /courses/:courseId/activities — fetch all activities for a course
+router.get("/", verifyToken, async (req, res) => {
+  try {
+    const courseId = req.params.courseId as string;
+    const activitiesSnap = await adminDb
+      .collection("courses")
+      .doc(courseId)
+      .collection("gamification")
+      .orderBy("position", "asc")
+      .get();
+
+    const activities = activitiesSnap.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
+
+    res.json(success(activities));
+  } catch (err: unknown) {
+    console.error({
+      route: "GET /courses/:courseId/activities",
+      courseId: req.params.courseId,
+      error: err,
+    });
+    res.status(500).json(error("FETCH_FAILED", "Failed to fetch activities"));
+  }
+});
+
 // GET /courses/:courseId/activities/:activityId — unified student/admin fetch
 router.get(
   "/:activityId",

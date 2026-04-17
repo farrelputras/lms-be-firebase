@@ -268,7 +268,7 @@ router.post("/", verifyToken, requireRole("admin"), async (req, res) => {
   }
 });
 
-// GET /courses/:courseId/activities — fetch all activities for a course
+// 1. GET ALL (Bulletproof list fetch)
 router.get("/", verifyToken, async (req, res) => {
   try {
     const courseId = req.params.courseId as string;
@@ -276,22 +276,41 @@ router.get("/", verifyToken, async (req, res) => {
       .collection("courses")
       .doc(courseId)
       .collection("gamification")
-      .orderBy("position", "asc")
-      .get();
+      .get(); // Removed orderBy to prevent Firestore from ghosting missing fields
 
     const activities = activitiesSnap.docs.map((doc) => ({
       id: doc.id,
       ...doc.data(),
-    }));
+    })).sort((a: any, b: any) => (a.position || 0) - (b.position || 0)); // Sort in JS safely
 
     res.json(success(activities));
   } catch (err: unknown) {
-    console.error({
-      route: "GET /courses/:courseId/activities",
-      courseId: req.params.courseId,
-      error: err,
-    });
+    console.error("GET ALL error", err);
     res.status(500).json(error("FETCH_FAILED", "Failed to fetch activities"));
+  }
+});
+
+// 2. GET ONE (Fixes the HTML 404 Crash)
+router.get("/:activityId", verifyToken, async (req, res) => {
+  try {
+    const courseId = req.params.courseId as string;
+    const activityId = req.params.activityId as string;
+    const docSnap = await adminDb
+      .collection("courses")
+      .doc(courseId)
+      .collection("gamification")
+      .doc(activityId)
+      .get();
+
+    if (!docSnap.exists) {
+      res.status(404).json(error("NOT_FOUND", "Activity not found"));
+      return;
+    }
+
+    res.json(success({ id: docSnap.id, ...docSnap.data() }));
+  } catch (err: unknown) {
+    console.error("GET ONE error", err);
+    res.status(500).json(error("FETCH_FAILED", "Failed to fetch activity"));
   }
 });
 

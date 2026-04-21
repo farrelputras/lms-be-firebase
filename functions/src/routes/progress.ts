@@ -2,7 +2,7 @@ import {Router} from "express";
 import {FieldValue} from "firebase-admin/firestore";
 
 import {adminDb} from "../firebaseAdmin.js";
-import {checkEnrollment} from "../middleware/checkEnrollment.js";
+import {requirePublishedCourse} from "../middleware/requirePublishedCourse.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {checkAndAwardBadges} from "../utils/badges.js";
 import {success, error} from "../utils/response.js";
@@ -12,7 +12,7 @@ const router = Router({mergeParams: true});
 router.use(verifyToken);
 
 // POST /courses/:courseId/progress — mark a chapter as completed
-router.post("/", checkEnrollment, async (req, res) => {
+router.post("/", requirePublishedCourse, async (req, res) => {
   try {
     const {chapterId} = req.body as {
       chapterId?: string;
@@ -135,7 +135,7 @@ router.post("/", checkEnrollment, async (req, res) => {
 });
 
 // GET /courses/:courseId/progress — get progress for a course
-router.get("/", async (req, res) => {
+router.get("/", requirePublishedCourse, async (req, res) => {
   try {
     const uid = req.user!.uid;
     const {courseId} = req.params as {courseId: string};
@@ -173,7 +173,7 @@ router.get("/", async (req, res) => {
 });
 
 // DELETE /courses/:courseId/progress — reset progress for testing
-router.delete("/", checkEnrollment, async (req, res) => {
+router.delete("/", requirePublishedCourse, async (req, res) => {
   try {
     const uid = req.user!.uid;
     const {courseId} = req.params as {courseId: string};

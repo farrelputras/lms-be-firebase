@@ -2,7 +2,7 @@ import {Router} from "express";
 
 import {adminDb, normalizeFirestoreData} from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
-import {checkEnrollment} from "../middleware/checkEnrollment.js";
+import {requirePublishedCourse} from "../middleware/requirePublishedCourse.js";
 import {success, error} from "../utils/response.js";
 
 type ActivityType = "drag_drop" | "word_search" | "true_or_false";
@@ -84,7 +84,7 @@ const sanitizeActivityData = (
   return data;
 };
 
-router.get("/", verifyToken, checkEnrollment, async (req, res) => {
+router.get("/", verifyToken, requirePublishedCourse, async (req, res) => {
   try {
     const courseId = req.params.courseId as string;
     const uid = req.user!.uid;

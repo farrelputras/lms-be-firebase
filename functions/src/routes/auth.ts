@@ -127,4 +127,42 @@ router.get("/me", verifyToken, async (req, res) => {
   }
 });
 
+// POST /auth/sync — Bridges Client-Side Auth with Server-Side Firestore
+router.post("/sync", verifyToken, async (req, res) => {
+  try {
+    // 1. Safely extract UID directly from the verified token
+    const uid = req.user!.uid;
+    const email = req.user!.email || req.body.email; 
+    const displayName = req.body.displayName || email?.split("@")[0] || "Student";
+
+    const userRef = adminDb.collection("users").doc(uid);
+    const docSnap = await userRef.get();
+
+    // 2. Only create the document if it doesn't already exist
+    if (!docSnap.exists) {
+      await userRef.set({
+        name: displayName,
+        email: email,
+        role: "student",
+        totalPoints: 0,
+        isActive: true,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      // 3. Ensure they have the correct Custom Claim in Firebase Auth
+      await adminAuth.setCustomUserClaims(uid, { role: "student" });
+    }
+
+    res.status(201).json(success({ 
+      message: "User synced successfully", 
+      uid: uid 
+    }));
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    console.error("Sync Error:", msg);
+    res.status(500).json(error("SYNC_FAILED", "Failed to sync user profile"));
+  }
+});
+
 export default router;

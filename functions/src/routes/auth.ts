@@ -120,47 +120,59 @@ router.get("/me", verifyToken, async (req, res) => {
         profile.totalPoints,
       badges: profile.badges === undefined ? [] : profile.badges,
     }));
-  } catch {
-    res.status(500).json(
-      error("FETCH_FAILED", "Failed to fetch user profile")
-    );
-  }
+  } catch (err: any) {
+  // JSON.stringify ensures the error isn't hidden in the cloud logs
+  console.error("🔴 AUTH_ME_ERROR:", JSON.stringify({
+    message: err.message,
+    stack: err.stack
+  }));
+  res.status(500).json(error("FETCH_FAILED", err.message || "Unknown error"));
+}
 });
 
 // POST /auth/sync — Bridges Client-Side Auth with Server-Side Firestore
 router.post("/sync", verifyToken, async (req, res) => {
   try {
-    // 1. Safely extract UID directly from the verified token
     const uid = req.user!.uid;
     const email = req.user!.email || req.body.email; 
-    const displayName = req.body.displayName || email?.split("@")[0] || "Student";
+    const displayName = req.body.displayName || email?.split("@")[0] || "User";
 
     const userRef = adminDb.collection("users").doc(uid);
-    const docSnap = await userRef.get();
+    let docSnap = await userRef.get();
 
-    // 2. Only create the document if it doesn't already exist
+    // 1. Create user if they don't exist
     if (!docSnap.exists) {
-      await userRef.set({
+      const newUser = {
         name: displayName,
         email: email,
-        role: "student",
+        role: "student", // Default for new signups
         totalPoints: 0,
         isActive: true,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
-      });
-
-      // 3. Ensure they have the correct Custom Claim in Firebase Auth
-      await adminAuth.setCustomUserClaims(uid, { role: "student" });
+      };
+      await userRef.set(newUser);
+      
+      // Refresh the snapshot so we can use it in Step 2
+      docSnap = await userRef.get();
     }
+
+    // 2. SOURCE OF TRUTH: Get the actual role from Firestore
+    const userData = docSnap.data();
+    const currentRole = userData?.role || "student";
+
+    // 3. PASSPORT UPDATE: Always sync Firestore role to Firebase Auth Claims
+    // This ensures that if you manually change a role in Firestore, 
+    // the user gets the permission on their next sync/login.
+    await adminAuth.setCustomUserClaims(uid, { role: currentRole });
 
     res.status(201).json(success({ 
       message: "User synced successfully", 
-      uid: uid 
+      uid: uid,
+      role: currentRole // Useful for the Flutter side to know
     }));
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Unknown error";
-    console.error("Sync Error:", msg);
+    console.error("Sync Error:", err);
     res.status(500).json(error("SYNC_FAILED", "Failed to sync user profile"));
   }
 });

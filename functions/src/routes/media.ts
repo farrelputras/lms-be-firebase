@@ -1,59 +1,78 @@
 import { Router } from "express";
-import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
 import { adminStorage } from "../firebaseAdmin.js";
 import { verifyToken } from "../middleware/verifyToken.js";
 import { requireRole } from "../middleware/requireRole.js";
 import { success, error } from "../utils/response.js";
+import busboy from "busboy";
 
 const router = Router();
 
-// Configure multer to store files in memory temporarily
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
-  },
-});
-
-// POST /media/upload — Admin only
 router.post(
   "/upload",
   verifyToken,
   requireRole("admin"),
-  upload.single("file"), // Flutter must use 'file' as the form-data key
   async (req, res) => {
     try {
-      if (!req.file) {
-        res.status(400).json(error("BAD_REQUEST", "No image file provided"));
-        return;
-      }
+      // Use busboy directly instead of multer
+      // Multer conflicts with Firebase Functions v2 body buffering
+      const bb = busboy({ headers: req.headers });
+      
+      let fileBuffer: Buffer | null = null;
+      let fileName = "";
+      let fileMime = "";
 
-      // 1. Target the default bucket
-      const bucket = adminStorage.bucket();
-
-      // 2. Create a unique filename
-      const extension = req.file.originalname.split('.').pop();
-      const filename = `thumbnails/${uuidv4()}.${extension}`;
-      const fileRef = bucket.file(filename);
-
-      // 3. Upload the buffer to Firebase Storage
-      await fileRef.save(req.file.buffer, {
-        metadata: {
-          contentType: req.file.mimetype,
-        },
+      bb.on("file", (_fieldname, fileStream, info) => {
+        fileName = info.filename;
+        fileMime = info.mimeType;
+        const chunks: Buffer[] = [];
+        fileStream.on("data", (chunk) => chunks.push(chunk));
+        fileStream.on("end", () => {
+          fileBuffer = Buffer.concat(chunks);
+        });
       });
 
-      // 4. Make the file publicly readable (so Flutter can use Image.network)
-      await fileRef.makePublic();
+      bb.on("finish", async () => {
+        try {
+          if (!fileBuffer || fileBuffer.length === 0) {
+            res.status(400).json(error("BAD_REQUEST", "No image file provided"));
+            return;
+          }
 
-      // 5. Construct the public URL
-      const publicUrl = `https://storage.googleapis.com/${bucket.name}/${filename}`;
+          const bucket = adminStorage.bucket();
+          const ext = fileName.split(".").pop() ?? "jpg";
+          const filename = `thumbnails/${uuidv4()}.${ext}`;
+          const fileRef = bucket.file(filename);
 
-      res.status(201).json(success({ imageUrl: publicUrl }));
+          await fileRef.save(fileBuffer, {
+            metadata: { contentType: fileMime },
+          });
+
+          const encodedFilename = encodeURIComponent(filename);
+          const publicUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodedFilename}?alt=media`;
+
+          res.status(201).json(success({ imageUrl: publicUrl }));
+        } catch (err: unknown) {
+          console.error("Upload Error:", err);
+          res.status(500).json(error("UPLOAD_FAILED", String(err)));
+        }
+      });
+
+      if ((req as any).rawBody) {
+  // Firebase Functions v2 already buffered the body into rawBody
+  const { Readable } = require('stream');
+  const readable = new Readable();
+  readable.push((req as any).rawBody);
+  readable.push(null);
+  readable.pipe(bb);
+} else {
+  req.pipe(bb);
+}
+
+      req.pipe(bb);
     } catch (err: unknown) {
       console.error("Upload Error:", err);
-      res.status(500).json(error("UPLOAD_FAILED", "Failed to upload image"));
+      res.status(500).json(error("UPLOAD_FAILED", String(err)));
     }
   }
 );

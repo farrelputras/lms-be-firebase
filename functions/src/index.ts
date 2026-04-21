@@ -26,7 +26,12 @@ app.use(
     origin: "*",
   })
 );
-app.use(express.json());
+app.use((req, res, next) => {
+  if (req.headers['content-type']?.startsWith('multipart/form-data')) {
+    return next(); // skip body parsing entirely, let multer handle it
+  }
+  express.json()(req, res, next);
+});
 
 // Health check
 app.get("/health", (_req, res) => {
@@ -45,10 +50,27 @@ app.use("/v1/courses/:courseId/progress", progressRouter);
 app.use("/v1/storage", storageRouter);
 app.use("/v1/leaderboard", leaderboardRouter);
 app.use("/v1/media", mediaRouter);
+app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error("Unhandled Express Error:", err);
+  res.status(500).json({ 
+    success: false, 
+    error: { code: "INTERNAL_ERROR", message: err.message } 
+  });
+});
 
 export const api = onRequest(
   {
-    cors: false,
+    memory: "512MiB",
+    timeoutSeconds: 60,
   },
-  app
+  (req, res) => {
+    if (req.rawBody && req.headers['content-type']?.startsWith('multipart/form-data')) {
+      const { Readable } = require('stream');
+      const readable = new Readable();
+      readable.push(req.rawBody);
+      readable.push(null);
+      Object.assign(req, readable);
+    }
+    app(req, res);
+  }
 );

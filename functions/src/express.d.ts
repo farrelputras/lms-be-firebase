@@ -5,5 +5,6 @@ declare namespace Express {
       email: string;
       role: string;
     };
+    rawBody?: Buffer;
   }
 }

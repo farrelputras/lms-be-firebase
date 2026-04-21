@@ -6,13 +6,13 @@ import {
 } from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
-import {checkEnrollment} from "../middleware/checkEnrollment.js";
+import {requirePublishedCourse} from "../middleware/requirePublishedCourse.js";
 import {success, error} from "../utils/response.js";
 
 const router = Router({mergeParams: true});
 
 // GET /courses/:courseId/chapters — auth + enrolled or admin
-router.get("/", verifyToken, checkEnrollment, async (req, res) => {
+router.get("/", verifyToken, requirePublishedCourse, async (req, res) => {
   try {
     const courseId = req.params.courseId as string;
     const snapshot = await adminDb
@@ -35,7 +35,7 @@ router.get("/", verifyToken, checkEnrollment, async (req, res) => {
 router.get(
   "/:chapterId",
   verifyToken,
-  checkEnrollment,
+  requirePublishedCourse,
   async (req, res) => {
     try {
       const courseId = req.params.courseId as string;

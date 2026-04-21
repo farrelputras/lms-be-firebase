@@ -4,7 +4,7 @@ import {FieldValue} from "firebase-admin/firestore";
 import {adminDb, normalizeFirestoreData} from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
-import {checkEnrollment} from "../middleware/checkEnrollment.js";
+import {requirePublishedCourse} from "../middleware/requirePublishedCourse.js";
 import {checkAndAwardBadges} from "../utils/badges.js";
 import {success, error} from "../utils/response.js";
 
@@ -269,7 +269,7 @@ router.post("/", verifyToken, requireRole("admin"), async (req, res) => {
 });
 
 // GET /courses/:courseId/activities — fetch all activities for a course
-router.get("/", verifyToken, async (req, res) => {
+router.get("/", verifyToken, requirePublishedCourse, async (req, res) => {
   try {
     const courseId = req.params.courseId as string;
     const activitiesSnap = await adminDb
@@ -299,7 +299,7 @@ router.get("/", verifyToken, async (req, res) => {
 router.get(
   "/:activityId",
   verifyToken,
-  checkEnrollment,
+  requirePublishedCourse,
   async (req, res) => {
     try {
       const courseId = req.params.courseId as string;
@@ -441,7 +441,7 @@ router.get(
 router.post(
   "/:activityId/submit",
   verifyToken,
-  checkEnrollment,
+  requirePublishedCourse,
   async (req, res) => {
     try {
       const courseId = req.params.courseId as string;

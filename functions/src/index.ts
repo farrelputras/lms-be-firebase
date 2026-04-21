@@ -15,6 +15,7 @@ import enrollmentsRouter from "./routes/enrollments.js";
 import progressRouter from "./routes/progress.js";
 import storageRouter from "./routes/storage.js";
 import leaderboardRouter from "./routes/leaderboard.js";
+import mediaRouter from "./routes/media.js";
 
 setGlobalOptions({maxInstances: 10});
 
@@ -45,6 +46,7 @@ app.use("/v1/enrollments", enrollmentsRouter);
 app.use("/v1/courses/:courseId/progress", progressRouter);
 app.use("/v1/storage", storageRouter);
 app.use("/v1/leaderboard", leaderboardRouter);
+app.use("/v1/media", mediaRouter);
 
 export const api = onRequest(
   {

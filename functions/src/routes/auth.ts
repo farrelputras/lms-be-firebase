@@ -4,6 +4,7 @@ import {FieldValue} from "firebase-admin/firestore";
 import {adminAuth, adminDb, normalizeFirestoreData} from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
+import {checkAndAwardBadges, BADGE_REGISTRY} from "../utils/badges.js";
 import {success, error} from "../utils/response.js";
 
 const router = Router();
@@ -42,11 +43,19 @@ router.post("/register", async (req, res) => {
       createdAt: FieldValue.serverTimestamp(),
     });
 
+    // Award "Perintis Baru" badge
+    const badgeIds = await checkAndAwardBadges(userRecord.uid, adminDb, { type: "account_created" });
+    const earnedBadges = badgeIds.map(id => ({
+      id,
+      ...BADGE_REGISTRY[id as keyof typeof BADGE_REGISTRY]
+    }));
+
     res.status(201).json(success({
       uid: userRecord.uid,
       email: userRecord.email,
       name: displayName,
       role: "student",
+      earnedBadges, // Send to UI
     }));
   } catch (err: unknown) {
     const msg =
@@ -139,6 +148,8 @@ router.post("/sync", verifyToken, async (req, res) => {
 
     const userRef = adminDb.collection("users").doc(uid);
     let docSnap = await userRef.get();
+    
+    let earnedBadges: Array<{id: string; name: string; icon: string; color: string}> = [];
 
     // 1. Create user if they don't exist
     if (!docSnap.exists) {
@@ -155,6 +166,13 @@ router.post("/sync", verifyToken, async (req, res) => {
       
       // Refresh the snapshot so we can use it in Step 2
       docSnap = await userRef.get();
+
+      // 🔥 Trigger Newcomer Badge 🔥
+      const badgeIds = await checkAndAwardBadges(uid, adminDb, { type: "account_created" });
+      earnedBadges = badgeIds.map(id => ({
+        id,
+        ...BADGE_REGISTRY[id as keyof typeof BADGE_REGISTRY]
+      }));
     }
 
     // 2. SOURCE OF TRUTH: Get the actual role from Firestore
@@ -169,7 +187,8 @@ router.post("/sync", verifyToken, async (req, res) => {
     res.status(201).json(success({ 
       message: "User synced successfully", 
       uid: uid,
-      role: currentRole // Useful for the Flutter side to know
+      role: currentRole, // Useful for the Flutter side to know
+      earnedBadges // Pass the new badges to the Flutter Overlay
     }));
   } catch (err: unknown) {
     console.error("Sync Error:", err);

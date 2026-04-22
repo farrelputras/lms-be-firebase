@@ -5,7 +5,7 @@ import {adminDb, normalizeFirestoreData} from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
 import {requirePublishedCourse} from "../middleware/requirePublishedCourse.js";
-import {checkAndAwardBadges} from "../utils/badges.js";
+import {checkAndAwardBadges, BADGE_REGISTRY} from "../utils/badges.js";
 import {success, error} from "../utils/response.js";
 
 type ActivityType = "drag_drop" | "word_search" | "true_or_false";
@@ -572,23 +572,23 @@ router.post(
         await userRef.update({totalPoints: FieldValue.increment(pointsDelta)});
       }
 
-      const badges: string[] = [];
-      const submittedBadges = await checkAndAwardBadges(uid, adminDb, {
+      // 1. Check for standard gamification badges
+      const submittedBadgeIds = await checkAndAwardBadges(uid, adminDb, {
         type: "activity_submitted",
-        activityType,
-        earnedPoints,
-        maxPoints,
+        correctCount,
+        totalQuestions: totalCount,
       });
-      badges.push(...submittedBadges);
+      
+      // 2. Perform a secondary check for leaderboard achievements
+      const rankBadgeIds = await checkAndAwardBadges(uid, adminDb, {
+        type: "leaderboard_update"
+      });
 
-      if (earnedPoints === maxPoints && maxPoints > 0) {
-        const perfectBadges = await checkAndAwardBadges(uid, adminDb, {
-          type: "activity_perfect",
-          activityType,
-          maxPoints,
-        });
-        badges.push(...perfectBadges);
-      }
+      // 3. Transform the IDs into the metadata object for Flutter to consume
+      const earnedBadges = [...submittedBadgeIds, ...rankBadgeIds].map(id => ({
+          id,
+          ...BADGE_REGISTRY[id as keyof typeof BADGE_REGISTRY]
+      }));
 
       res.json(success({
         score: correctCount,
@@ -597,7 +597,7 @@ router.post(
         pointsEarned: pointsDelta,
         earnedPoints,
         isNewCompletion,
-        badges,
+        earnedBadges, // Send the newly formatted badges to the frontend
         feedback,
       }));
     } catch (err: unknown) {

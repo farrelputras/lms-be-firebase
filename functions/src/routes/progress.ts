@@ -4,7 +4,7 @@ import {FieldValue} from "firebase-admin/firestore";
 import {adminDb} from "../firebaseAdmin.js";
 import {requirePublishedCourse} from "../middleware/requirePublishedCourse.js";
 import {verifyToken} from "../middleware/verifyToken.js";
-import {checkAndAwardBadges} from "../utils/badges.js";
+import {checkAndAwardBadges, BADGE_REGISTRY} from "../utils/badges.js";
 import {success, error} from "../utils/response.js";
 
 const router = Router({mergeParams: true});
@@ -94,29 +94,49 @@ router.post("/", requirePublishedCourse, async (req, res) => {
     }
 
     let pointsAwarded = 0;
-    let badges: string[] = [];
+    // Changed to an array of objects to pass the full Material UI data to Flutter
+    let earnedBadges: Array<{id: string; name: string; icon: string; color: string}> = []; 
+
     if (isNewCompletion) {
+      // Award points for completion
       await adminDb.collection("users").doc(uid).set({
         totalPoints: FieldValue.increment(10),
       }, {merge: true});
 
       pointsAwarded = 10;
-      badges = await checkAndAwardBadges(uid, adminDb, {type: "points_update"});
+      
+      // 1. Check for the "First Step" Chapter Completion Badge
+      const chapterBadgeIds = await checkAndAwardBadges(uid, adminDb, {
+        type: "chapter_finished"
+      });
+
+      // 2. Secondary check for Leaderboard Achievements since points increased
+      const rankBadgeIds = await checkAndAwardBadges(uid, adminDb, {
+        type: "leaderboard_update"
+      });
+
+      // 3. Map the strings to full objects from the registry
+      const combinedIds = [...chapterBadgeIds, ...rankBadgeIds];
+      earnedBadges = combinedIds.map(id => ({
+        id,
+        ...BADGE_REGISTRY[id as keyof typeof BADGE_REGISTRY]
+      }));
     }
 
+    // Using earnedBadges so it perfectly matches the Flutter JSON parsing
     if (existing.exists) {
       res.json(success({
         completedChapters: completed,
         percentage,
         pointsAwarded,
-        badges,
+        earnedBadges, 
       }));
     } else {
       res.status(201).json(success({
         completedChapters: completed,
         percentage,
         pointsAwarded,
-        badges,
+        earnedBadges,
       }));
     }
   } catch (err: unknown) {

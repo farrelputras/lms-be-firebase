@@ -24,6 +24,7 @@ This guide is written for frontend developers (web or mobile) consuming the LMS 
 - [Enrollment Endpoints](#enrollment-endpoints)
 - [Leaderboard Endpoint](#leaderboard-endpoint)
 - [Storage Endpoints](#storage-endpoints)
+- [Media Endpoints](#media-endpoints)
 - [Gamification — Points and Badges](#gamification--points-and-badges)
 - [Things That Will Catch You Off Guard](#things-that-will-catch-you-off-guard)
 
@@ -153,7 +154,40 @@ Creates a Firebase Auth account, assigns the `student` role, and creates the use
     "uid": "abc123xyz",
     "email": "student@example.com",
     "name": "Budi Santoso",
-    "role": "student"
+    "role": "student",
+    "earnedBadges": [
+      {
+        "id": "newcomer",
+        "name": "Newcomer",
+        "icon": "celebration",
+        "color": "blue"
+      }
+    ]
+  }
+}
+```
+
+### Sync current user + claims — `POST /v1/auth/sync`
+
+Requires authentication. This endpoint ensures a Firestore user profile exists for the authenticated Firebase user, syncs custom claims from Firestore role, and may return newly awarded onboarding badges.
+
+```json
+// Optional request body
+{
+  "email": "student@example.com",
+  "displayName": "Budi Santoso"
+}
+```
+
+```json
+// Response
+{
+  "success": true,
+  "data": {
+    "message": "User synced successfully",
+    "uid": "abc123xyz",
+    "role": "student",
+    "earnedBadges": []
   }
 }
 ```
@@ -282,7 +316,14 @@ This is the most complex endpoint in the API. It scores answers server-side, awa
     "total": 3,
     "passed": true,
     "pointsAwarded": 3,
-    "badges": ["perfect_score"],
+    "earnedBadges": [
+      {
+        "id": "perfect_score",
+        "name": "Perfect Score",
+        "icon": "verified",
+        "color": "amber"
+      }
+    ],
     "answers": [
       { "questionId": "0", "correct": true },
       { "questionId": "1", "correct": true },
@@ -292,7 +333,7 @@ This is the most complex endpoint in the API. It scores answers server-side, awa
 }
 ```
 
-The `passed` field is `true` **only when the student answered every question correctly** (100%). It is `false` for any partial score, including 19 out of 20. Use this field to drive the perfect score UI state. The `pointsAwarded` field always equals `score` — one point per correct answer. Points are awarded on every submission including retakes, so a student who retakes a quiz earns points each time. The `badges` array contains only badges newly awarded on this specific submission — it will be empty on retakes where the badge was already earned previously.
+The `passed` field is `true` **only when the student answered every question correctly** (100%). It is `false` for any partial score, including 19 out of 20. Use this field to drive the perfect score UI state. The `pointsAwarded` field always equals `score` — one point per correct answer. Points are awarded on every submission including retakes, so a student who retakes a quiz earns points each time. The `earnedBadges` array contains only badges newly awarded on this specific submission and includes metadata (`id`, `name`, `icon`, `color`).
 
 After receiving a submit response, call `GET /auth/me` to refresh the user's full profile state so that `totalPoints` and `badges` are up to date in your UI.
 
@@ -416,7 +457,7 @@ The answer format differs by activity type.
     "earnedPoints": 10,
     "pointsEarned": 10,
     "isNewCompletion": true,
-    "badges": [],
+    "earnedBadges": [],
     "feedback": [
       { "id": "item1", "correct": true, "correctCategory": "Sosial" },
       { "id": "item2", "correct": true, "correctCategory": "Komersial" }
@@ -518,7 +559,7 @@ Marks a chapter as completed for the calling user. The `courseId` goes in the UR
     "completedChapters": ["chapterIdAbc"],
     "percentage": 50,
     "pointsAwarded": 10,
-    "badges": []
+    "earnedBadges": []
   }
 }
 ```
@@ -611,6 +652,34 @@ Returns a signed read URL valid for 1 hour. The `:fileId` is the file path in Cl
 
 ---
 
+## Media Endpoints
+
+### Resolve a media path to a view URL — `GET /v1/media/view?path=<filePath>`
+
+Returns a redirect to a signed read URL by default. This lets clients render media using a backend URL while keeping storage provider details hidden behind backend contracts.
+
+Query params:
+- `path` (required): storage file path (currently restricted to `thumbnails/...`)
+- `redirect` (optional): set to `0` to receive JSON instead of HTTP redirect
+
+Default behavior (`redirect` omitted or not `0`):
+- HTTP `302` redirect to signed URL
+
+JSON behavior (`redirect=0`):
+```json
+{
+  "success": true,
+  "data": {
+    "viewUrl": "https://...signed...",
+    "filePath": "thumbnails/example.jpg"
+  }
+}
+```
+
+This endpoint currently validates path format and existence, then signs a read URL for 1 hour.
+
+---
+
 ## Gamification — Points and Badges
 
 Understanding the gamification system helps you build the right UI reactions at the right moments.
@@ -620,11 +689,17 @@ Understanding the gamification system helps you build the right UI reactions at 
 - **Quiz submission** — `+1 point per correct answer` on every submission including retakes.
 - **Activity submission** — proportional points based on score vs `maxPoints`. Only the *improvement* over the student's previous best is credited to `totalPoints`. The response field `pointsEarned` is this delta; `earnedPoints` is the raw points scored this attempt.
 
-**Badges** are strings stored in an array on the user profile. There are currently two badges. The `perfect_score` badge is awarded when a quiz submission has `passed: true` (100% score). The `top_3` badge is awarded when the user's `totalPoints` rank is within the top 3 on the leaderboard after any point increment. Both badges are idempotent — they are awarded exactly once and never duplicated, so you can safely check for their presence in `users.badges` without worrying about counting duplicates.
+**Badges** are strings stored in `users.badges` and awarded idempotently. Current badge IDs are:
+- `newcomer`
+- `first_step`
+- `active_learner`
+- `perfect_score`
+- `top_3`
+- `number_1`
 
-Activity submissions also invoke badge checks via `activity_submitted` and `activity_perfect` events — these badge rules are not yet implemented but will be added without changing the response shape.
+Action endpoints now return newly awarded badges as `earnedBadges` objects with metadata (`id`, `name`, `icon`, `color`) so clients can render UI immediately without extra lookup tables.
 
-The recommended UI pattern for gamification feedback is to read the points and `badges` fields from the immediate response to drive the animation or modal, then call `GET /auth/me` in the background to refresh the global user state so the header or profile page shows the updated totals.
+The recommended UI pattern for gamification feedback is to read points plus `earnedBadges` from the immediate response to drive animation/modal, then call `GET /auth/me` in the background to refresh global user totals and persistent badge array.
 
 ---
 
@@ -638,7 +713,7 @@ These are subtle behaviours that are easy to miss and hard to debug once you hit
 
 **`passed` means 100%, not "above passing grade".** The `passed` field in the quiz submit response is `true` only when every single question is correct. A quiz with a `passingGrade` of 8 out of 20 questions does not set `passed: true` at 8 correct — that field is exclusively for the perfect score state. You will need to implement your own passing grade logic on the frontend using `score` and `passingGrade` from the quiz document.
 
-**`GET /auth/me` after gamification actions.** The submit and progress responses return `pointsAwarded` and `badges` for the immediate action, but they do not return the updated `totalPoints` cumulative value. Call `GET /auth/me` after these actions to get the updated total for display in the header or profile.
+**`GET /auth/me` after gamification actions.** Submit/progress responses include immediate points fields (`pointsAwarded` or `pointsEarned`) and `earnedBadges`, but they do not return updated cumulative `totalPoints`. Call `GET /auth/me` after these actions to refresh totals shown in header/profile.
 
 **Unpublished courses return `404`, not `403`.** If you are building an admin preview feature where an admin views an unpublished course as a student would, be aware that the non-admin path returns `404` for unpublished content — there is no way to distinguish "course does not exist" from "course exists but is unpublished" from the non-admin perspective. Use an admin token if the admin needs to preview unpublished content.
 

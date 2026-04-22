@@ -5,7 +5,7 @@ import {adminDb, normalizeFirestoreData} from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
 import {requirePublishedCourse} from "../middleware/requirePublishedCourse.js";
-import {checkAndAwardBadges} from "../utils/badges.js";
+import {checkAndAwardBadges, BADGE_REGISTRY} from "../utils/badges.js";
 import {success, error} from "../utils/response.js";
 
 interface QuizQuestion {
@@ -311,11 +311,24 @@ router.post(
         totalPoints: FieldValue.increment(correctCount),
       }, {merge: true});
 
-      const badges = await checkAndAwardBadges(uid, adminDb, {
-        type: "quiz_submit",
+      // 1. Submit basic quiz activity check
+      const submittedBadgeIds = await checkAndAwardBadges(uid, adminDb, {
+        type: "activity_submitted",
         correctCount,
         totalQuestions,
       });
+
+      // 2. Leaderboard check (since points were just awarded)
+      const rankBadgeIds = await checkAndAwardBadges(uid, adminDb, {
+        type: "leaderboard_update"
+      });
+
+      // 3. Combine and map to metadata objects
+      const combinedIds = [...submittedBadgeIds, ...rankBadgeIds];
+      const earnedBadges = combinedIds.map(id => ({
+        id,
+        ...BADGE_REGISTRY[id as keyof typeof BADGE_REGISTRY]
+      }));
 
       const answerSummary = questions.map((q, i) => ({
         questionId: ((q as unknown as Record<string, unknown>).id as string) ||
@@ -344,7 +357,7 @@ router.post(
         total: totalQuestions,
         passed: correctCount === totalQuestions,
         pointsAwarded: correctCount,
-        badges,
+        earnedBadges, // Updated to pass the full badge objects
         answers: answerSummary,
       }));
     } catch (err: unknown) {

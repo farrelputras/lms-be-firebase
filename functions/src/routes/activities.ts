@@ -592,6 +592,7 @@ router.post(
 
       res.json(success({
         score: correctCount,
+        totalItems: totalCount,
         maxPoints,
         scorePercent,
         pointsEarned: pointsDelta,

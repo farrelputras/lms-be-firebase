@@ -12,6 +12,7 @@ import {success, error} from "../utils/response.js";
 const router = Router();
 
 // GET /courses — public (admins see all, others see published only)
+// 🛡️ INCLUDES AGGREGATED PROGRESS FOR AUTHENTICATED USERS
 router.get("/", optionalAuth, async (req, res) => {
   try {
     let query: FirebaseFirestore.Query = adminDb.collection("courses");
@@ -21,8 +22,38 @@ router.get("/", optionalAuth, async (req, res) => {
 
     const snapshot = await query.get();
     const courses = snapshot.docs.map((docSnap) => mapDoc(docSnap));
+
+    // 🛡️ THE SIDDIQ-LEVEL FIX: Eager-load progress if the user is authenticated
+    if (req.user) {
+      // 1 single query for ALL progress instead of N queries
+      const progressSnapshot = await adminDb
+        .collection("progress")
+        .where("userId", "==", req.user.uid)
+        .get();
+
+      // Build an O(1) lookup map
+      const progressMap: Record<string, number> = {};
+      progressSnapshot.docs.forEach((doc) => {
+        const data = doc.data();
+        if (data.courseId) {
+          progressMap[data.courseId] = data.percentage || 0;
+        }
+      });
+
+      // Stitch the percentage directly into the course objects
+      const coursesWithProgress = courses.map((course: any) => ({
+        ...course,
+        progressPercentage: progressMap[course.id] || 0,
+      }));
+
+      res.json(success(coursesWithProgress));
+      return;
+    }
+
+    // Fallback for unauthenticated requests
     res.json(success(courses));
-  } catch {
+  } catch (err) {
+    console.error("Failed to fetch courses:", err);
     res.status(500).json(
       error("FETCH_FAILED", "Failed to fetch courses")
     );

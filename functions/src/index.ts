@@ -15,6 +15,7 @@ import progressRouter from "./routes/progress.js";
 import storageRouter from "./routes/storage.js";
 import leaderboardRouter from "./routes/leaderboard.js";
 import mediaRouter from "./routes/media.js";
+import certificatesRouter from "./routes/certificates.js";
 
 setGlobalOptions({maxInstances: 10});
 
@@ -47,6 +48,7 @@ app.use("/v1/courses/:courseId/quizzes", quizzesRouter);
 app.use("/v1/courses/:courseId/activities", activitiesRouter);
 app.use("/v1/courses/:courseId/content", contentRouter);
 app.use("/v1/courses/:courseId/progress", progressRouter);
+app.use("/v1/courses/:courseId/certificates", certificatesRouter);
 app.use("/v1/storage", storageRouter);
 app.use("/v1/leaderboard", leaderboardRouter);
 app.use("/v1/media", mediaRouter);

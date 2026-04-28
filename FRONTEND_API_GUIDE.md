@@ -21,7 +21,8 @@ This guide is written for frontend developers (web or mobile) consuming the LMS 
 - [Activity Endpoints](#activity-endpoints)
 - [Course Content Endpoint](#course-content-endpoint)
 - [Progress Endpoints](#progress-endpoints) — mark complete, get progress, reset (dev only)
-- [Enrollment Endpoints](#enrollment-endpoints)
+- [Certificate Endpoints](#certificate-endpoints)
+- [Enrollment Endpoints](#enrollment-endpoints) ⚠️ currently unmounted — see section
 - [Leaderboard Endpoint](#leaderboard-endpoint)
 - [Storage Endpoints](#storage-endpoints)
 - [Media Endpoints](#media-endpoints)
@@ -223,6 +224,8 @@ Returns the full profile of the currently authenticated user. Call this after lo
 ### List courses — `GET /v1/courses`
 
 No token required. If the user is not authenticated, only published courses are returned. If the user is an admin, all courses (including unpublished) are returned. This means you can call this endpoint before the user logs in to show a course catalog.
+
+**For authenticated users only:** each course object in the array also includes a `progressPercentage` field (integer 0–100). This is batch-loaded server-side in a single query — you do not need to call the progress endpoint separately to populate a course list. Unauthenticated responses do not include this field.
 
 ### Get a single course — `GET /v1/courses/:courseId`
 
@@ -452,6 +455,7 @@ The answer format differs by activity type.
   "success": true,
   "data": {
     "score": 2,
+    "totalItems": 2,
     "maxPoints": 10,
     "scorePercent": 100,
     "earnedPoints": 10,
@@ -466,7 +470,7 @@ The answer format differs by activity type.
 }
 ```
 
-**`score`** is the raw correct count. **`earnedPoints`** is the proportional points scored this attempt (`Math.round(score / total * maxPoints)`). **`pointsEarned`** is the delta actually added to `totalPoints` — only the improvement over the student's previous best score is credited. On a first attempt these two fields are equal; on a retake where the student scored lower than before, `pointsEarned` will be `0`.
+**`score`** is the raw correct count. **`totalItems`** is the total number of scoreable items in the activity. **`earnedPoints`** is the proportional points scored this attempt (`Math.round(score / totalItems * maxPoints)`). **`pointsEarned`** is the delta actually added to `totalPoints` — only the improvement over the student's previous best score is credited. On a first attempt these two fields are equal; on a retake where the student scored lower than before, `pointsEarned` will be `0`.
 
 `isNewCompletion` is `true` on the first submission only. Use it to decide whether to trigger a course-progress animation. The activity is marked `completed: true` on the first submission and stays that way regardless of future scores.
 
@@ -597,7 +601,78 @@ After a successful reset the page should be reloaded so that the sidebar and pro
 
 ---
 
+## Certificate Endpoints
+
+All certificate routes are nested under `/v1/courses/:courseId/certificates`. Every request requires authentication (`verifyToken` is applied globally to the router).
+
+### Eligibility requirements
+
+A certificate can only be issued when **both** of the following are true:
+
+1. The student's `progress` document for the course has `percentage === 100` (all chapters completed).
+2. Every activity in the course's `gamification` subcollection has a corresponding `activity_progress` record for the student with `bestScore === 100` (perfect score on at least one attempt).
+
+If either condition is not met, the endpoint returns `403` with code `CERTIFICATE_NOT_ELIGIBLE`. If the course has no gamification activities, only the chapter-completion check applies.
+
+### Issue or retrieve a certificate — `POST /v1/courses/:courseId/certificates`
+
+Idempotent. If a certificate has already been issued for this student and course, the existing certificate is returned without creating a duplicate. If eligible and no certificate exists, a new one is created.
+
+```json
+// Response (new or existing certificate)
+{
+  "success": true,
+  "data": {
+    "id": "abc123xyz_3bViFooKRQSBQxVLjGIJ",
+    "userId": "abc123xyz",
+    "courseId": "3bViFooKRQSBQxVLjGIJ",
+    "userName": "Budi Santoso",
+    "courseName": "Pengantar Ekonomi Syariah",
+    "serialNumber": "CERT-3BVIF-ABC12-20260428",
+    "issuedAt": "2026-04-28T10:00:00.000Z",
+    "completionDate": "2026-04-28"
+  }
+}
+```
+
+`serialNumber` format: `CERT-{first 5 chars of courseId uppercased}-{first 5 chars of uid uppercased}-{YYYYMMDD}`.
+
+| HTTP Status | Code | What it means |
+|---|---|---|
+| `403` | `CERTIFICATE_NOT_ELIGIBLE` | Chapter progress is not 100%, or at least one activity does not have a 100% best score. |
+| `500` | `INTERNAL_ERROR` | Server error during issuance. |
+
+### Get my certificate — `GET /v1/courses/:courseId/certificates/me`
+
+Returns the student's existing certificate for the course. Does not issue a new one.
+
+```json
+// Response
+{
+  "success": true,
+  "data": {
+    "id": "abc123xyz_3bViFooKRQSBQxVLjGIJ",
+    "userId": "abc123xyz",
+    "courseId": "3bViFooKRQSBQxVLjGIJ",
+    "userName": "Budi Santoso",
+    "courseName": "Pengantar Ekonomi Syariah",
+    "serialNumber": "CERT-3BVIF-ABC12-20260428",
+    "issuedAt": "2026-04-28T10:00:00.000Z",
+    "completionDate": "2026-04-28"
+  }
+}
+```
+
+| HTTP Status | Code | What it means |
+|---|---|---|
+| `404` | `CERTIFICATE_NOT_FOUND` | No certificate has been issued yet for this student and course. |
+| `500` | `INTERNAL_ERROR` | Server error during retrieval. |
+
+---
+
 ## Enrollment Endpoints
+
+> ⚠️ **Known issue:** The enrollment router is currently not mounted in the backend entry point. All `/v1/enrollments/*` endpoints will return `404` until this is fixed. Do not build enrollment flows against the current production build — check with the backend team before using these routes.
 
 ### Check enrollment status — `GET /v1/enrollments/:courseId/status`
 
@@ -724,3 +799,9 @@ These are subtle behaviours that are easy to miss and hard to debug once you hit
 **Locked activities return `403 LOCKED`, not `403 FORBIDDEN`.** The error code is `LOCKED` rather than `FORBIDDEN`. Handle this separately in your UI — a locked activity should show a "complete the previous item first" prompt, not a generic access-denied message.
 
 **`drag_drop` and `true_or_false` strip correct answers on GET, same as quizzes.** When a student fetches an activity, `correctCategory` is removed from drag-drop items and `correct` is removed from true-or-false statements. The full shape is only visible to admins. Don't rely on the GET response to pre-populate correct answers on the frontend.
+
+**`progressPercentage` only appears for authenticated users on `GET /v1/courses`.** Unauthenticated responses omit this field entirely — do not default it to `0` if it is absent, as that may indicate the user is simply not logged in rather than having zero progress.
+
+**Certificate eligibility requires a perfect score on every activity, not just completion.** A student who has `completed: true` on all activities but whose `bestScore` is less than 100 on any one of them will receive `403 CERTIFICATE_NOT_ELIGIBLE` when calling `POST /certificates`. Completion and perfect score are tracked separately. Make sure your UI distinguishes "activity completed" from "activity perfected" if you want to show certificate eligibility progress.
+
+**Enrollment endpoints are currently unreachable.** The enrollment router exists in the backend but is not mounted. All `/v1/enrollments/*` calls will return `404`. Wait for the backend fix before implementing enrollment UI flows.

@@ -47,13 +47,15 @@ lms-be-firebase/
 │   │   │   ├── quizzes.ts
 │   │   │   ├── activities.ts
 │   │   │   ├── content.ts
-│   │   │   ├── enrollments.ts
+│   │   │   ├── certificates.ts
+│   │   │   ├── enrollments.ts        # ⚠️ file exists but NOT mounted in index.ts
 │   │   │   ├── progress.ts
 │   │   │   ├── storage.ts
+│   │   │   ├── media.ts
 │   │   │   └── leaderboard.ts
 │   │   └── utils/
 │   │       ├── response.ts           # success() and error() envelope helpers
-│   │       └── badges.ts             # checkAndAwardBadges utility
+│   │       └── badges.ts             # checkAndAwardBadges utility + BADGE_REGISTRY
 │   ├── scripts/
 │   │   ├── seedQuiz.mjs              # Seed a test quiz into a course
 │   │   └── test-badges.mjs           # Standalone badge logic tests
@@ -70,7 +72,7 @@ The only directory you should ever edit is `functions/src/`. The `functions/lib/
 
 The entrypoint is `functions/src/index.ts`. The boot sequence works as follows. First, `firebaseAdmin.ts` is imported, which initializes the Firebase Admin SDK using environment variables if they are present, or falls back to Application Default Credentials (ADC). The Admin SDK must be initialized before any route handler runs — this happens at module load time, not at request time, so initialization errors will appear in the cold-start log rather than in individual request logs.
 
-After the Admin SDK is ready, an Express app is created with the following global middleware applied in order: CORS (using the `CORS_ORIGIN` environment variable as an allowlist), and `express.json()` for body parsing. The global middleware runs before any route-specific middleware — this matters because body parsing must happen before any route handler attempts to read `req.body`.
+After the Admin SDK is ready, an Express app is created with the following global middleware applied in order: CORS (currently configured with `origin: "*"` — open to all origins; the `CORS_ORIGIN` environment variable approach is commented out), and a conditional `express.json()` body parser that skips multipart requests so that file upload routes handled by multer are not broken. The global middleware runs before any route-specific middleware — this matters because body parsing must happen before any route handler attempts to read `req.body`.
 
 Routes are then mounted under the `/v1` prefix. The order of mounting does not affect routing correctness since each mount path is distinct, but it does affect the order in which Express searches for a matching route, which has a negligible performance implication at MVP scale. Finally, the Express app is exported as a Firebase Cloud Function using `onRequest` with `maxInstances: 10`.
 
@@ -158,18 +160,22 @@ Each route file exports an Express `Router` instance. Routers are mounted in `in
 The mounting tree in `index.ts` looks like this:
 
 ```
-/health                              → inline handler in index.ts
-/v1/auth                             → routes/auth.ts
-/v1/users                            → routes/users.ts       (router.use(verifyToken, requireRole('admin')))
-/v1/courses                          → routes/courses.ts
-/v1/courses/:courseId/chapters       → routes/chapters.ts    (mergeParams: true)
-/v1/courses/:courseId/quizzes        → routes/quizzes.ts     (mergeParams: true)
-/v1/courses/:courseId/activities     → routes/activities.ts  (mergeParams: true)
-/v1/courses/:courseId/content        → routes/content.ts     (mergeParams: true, requires enrollment)
-/v1/enrollments                      → routes/enrollments.ts (router.use(verifyToken))
-/v1/courses/:courseId/progress       → routes/progress.ts    (mergeParams: true, router.use(verifyToken))
-/v1/storage                          → routes/storage.ts     (router.use(verifyToken))
-/v1/leaderboard                      → routes/leaderboard.ts
+/health                                   → inline handler in index.ts
+/v1/auth                                  → routes/auth.ts
+/v1/users                                 → routes/users.ts        (router.use(verifyToken, requireRole('admin')))
+/v1/courses                               → routes/courses.ts
+/v1/courses/:courseId/chapters            → routes/chapters.ts     (mergeParams: true)
+/v1/courses/:courseId/quizzes             → routes/quizzes.ts      (mergeParams: true)
+/v1/courses/:courseId/activities          → routes/activities.ts   (mergeParams: true)
+/v1/courses/:courseId/content             → routes/content.ts      (mergeParams: true, requires enrollment)
+/v1/courses/:courseId/progress            → routes/progress.ts     (mergeParams: true, router.use(verifyToken))
+/v1/courses/:courseId/certificates        → routes/certificates.ts (mergeParams: true, router.use(verifyToken))
+/v1/storage                               → routes/storage.ts      (router.use(verifyToken))
+/v1/leaderboard                           → routes/leaderboard.ts
+/v1/media                                 → routes/media.ts
+
+⚠️  NOT MOUNTED: routes/enrollments.ts exists with full implementation but is absent from index.ts.
+    All /v1/enrollments/* endpoints are currently unreachable (return 404).
 ```
 
 An important detail about the users router: it applies `verifyToken` and `requireRole('admin')` at the router level using `router.use(...)`. This means every route registered on that router — including routes added in the future — is automatically admin-protected without needing to specify it per route. This is the right pattern for route groups where every endpoint shares the same access requirements. For route groups with mixed access (like quizzes, where GET is enrolled-student and POST is admin), the middleware is applied per route instead.
@@ -202,6 +208,8 @@ All collections are at the Firestore root level except chapters and quizzes, whi
 
 **`activity_progress/{uid_activityId}`** — The document ID is a composite key in the format `{uid}_{activityId}`. Stores progress for gamification activities including `bestScore`, `bestScorePercent`, `attempts`, and `completed`.
 
+**`certificates/{uid_courseId}`** — The document ID is a composite key in the format `{uid}_{courseId}`. Created by `POST /v1/courses/:courseId/certificates` and is idempotent — if the document already exists the existing data is returned. Fields: `id`, `userId`, `courseId`, `userName`, `courseName`, `serialNumber` (format: `CERT-{courseId[0..5]}-{uid[0..5]}-{YYYYMMDD}`), `issuedAt` (server timestamp), `completionDate` (ISO date string derived from `issuedAt`). Eligibility gate: `progress.percentage === 100` AND `activity_progress.bestScore === 100` for every activity in the course's `gamification` subcollection.
+
 ---
 
 ## Gamification Internals
@@ -216,23 +224,43 @@ The chapter completion handler has one additional concern: it must only award po
 
 ### Badge utility — `src/utils/badges.ts`
 
-The `checkAndAwardBadges(uid, db, event)` function is called after every point write. It takes three arguments: the user's UID, the Firestore admin instance, and an event descriptor that is either `{ type: 'quiz_submit', correctCount, totalQuestions }` or `{ type: 'points_update' }`. It returns an array of newly awarded badge strings.
+The `checkAndAwardBadges(uid, db, event)` function is called after every significant user action. It takes three arguments: the user's UID, the Firestore admin instance, and a typed event descriptor. It returns an array of newly awarded `BadgeId` strings. The full event union is:
 
-Internally, the function reads the user's current `badges` array from Firestore, determines which badges should be awarded based on the event and the current leaderboard state, filters out any badges already present (idempotency), writes the updated array back to Firestore only if there are new badges to add, and returns the newly awarded badges. The function never writes to Firestore when there is nothing new to add — this avoids unnecessary writes on the hot path.
+```typescript
+type BadgeEvent =
+  | { type: "account_created" }
+  | { type: "chapter_finished" }
+  | { type: "activity_submitted"; correctCount: number; totalQuestions: number }
+  | { type: "leaderboard_update" }
+```
 
-The `top_3` check makes a Firestore query: `users` collection ordered by `totalPoints` descending, limited to 3. If the current user's UID appears in those 3 results, the badge is eligible. This is a 3-document read on every point-awarding action. It is acceptable at MVP scale. One known gap: this query does not filter `isActive=true`, meaning a soft-deleted user who still has high `totalPoints` in Firestore can occupy a top-3 slot and push an active user out of badge eligibility. The leaderboard endpoint does filter by `isActive` — this inconsistency is a known issue to fix in a future iteration.
+Call sites and their event types:
+- `auth.ts` — `account_created` → awards `newcomer`
+- `progress.ts` — `chapter_finished` → awards `first_step`
+- `activities.ts` submit — `activity_submitted` → awards `active_learner` always; awards `perfect_score` if `correctCount === totalQuestions`; then calls again with `leaderboard_update`
+- `quizzes.ts` submit — calls with `leaderboard_update` after awarding quiz points
+
+Internally, the function reads the user's current `badges` array from Firestore, evaluates rules for the given event, filters out badges already present (idempotency), writes the updated array back to Firestore only if there are new badges to add, and returns the newly awarded badges. The function never writes to Firestore when nothing is new — this avoids unnecessary writes on the hot path.
+
+The `leaderboard_update` event makes a Firestore query: `users` collection ordered by `totalPoints` descending, limited to 3. If the current user's UID appears at index 0 they are eligible for `number_1`; if they appear at any of the 3 positions they are eligible for `top_3`. This is a 3-document read on every point-awarding action. One known gap: this query does not filter `isActive=true` — see Known Issues.
 
 ```
 checkAndAwardBadges call flow:
 1. Read users/{uid}.badges from Firestore
-2. If event is quiz_submit and correctCount === totalQuestions → eligible for perfect_score
-3. Query top 3 users by totalPoints → check if uid appears → eligible for top_3
-4. Filter eligible badges against existing badges (remove already-earned ones)
-5. If any new badges remain:
+2. Evaluate badge rules for event type:
+   - account_created   → newcomer
+   - chapter_finished  → first_step
+   - activity_submitted and correctCount === totalQuestions → active_learner + perfect_score
+   - activity_submitted otherwise → active_learner
+   - leaderboard_update → query top 3; top_3 if present; number_1 if rank 0
+3. Filter eligible badges against existing badges (remove already-earned)
+4. If any new badges remain:
    a. Write updated badges array to users/{uid}
-   b. Return new badges
-6. If no new badges: return []
+   b. Return new badge IDs
+5. If no new badges: return []
 ```
+
+After each call, callers map the returned badge IDs through `BADGE_REGISTRY` (exported from `badges.ts`) to produce `{ id, name, icon, color }` objects for the response — so clients can render badge notifications immediately without a separate lookup.
 
 ---
 
@@ -244,7 +272,7 @@ checkAndAwardBadges call flow:
 | `CLIENT_EMAIL` | Yes (explicit init) | Service account email. |
 | `PRIVATE_KEY` | Yes (explicit init) | Service account private key. Newline-escaped — the code calls `.replace(/\\n/g, '\n')` during init. |
 | `STORAGE_BUCKET` | Yes (for storage routes) | GCS bucket name without `gs://` prefix. |
-| `CORS_ORIGIN` | No | Comma-separated list of allowed origins. Defaults to `http://localhost:3000`. |
+| `CORS_ORIGIN` | No | Currently unused — the CORS configuration in `index.ts` is hardcoded to `origin: "*"`. This variable is read from env but the line is commented out. Restore the commented block before any production deployment that requires CORS restriction. |
 
 If all four Admin SDK variables are present, the SDK initializes with explicit service account credentials. If any are missing, it falls back to ADC. For local development with the Firebase emulator, ADC works automatically — you do not need to provide the service account variables. For production deployment, always use explicit credentials via environment config.
 
@@ -312,10 +340,24 @@ These are issues in the current implementation that the next developer to touch 
 
 **Storage download path override is broad.** `GET /storage/download-url/:fileId` accepts a `?path=` query parameter that, if provided, overrides the `:fileId` param and signs any existing GCS path for any authenticated user. There is no ownership check or path boundary policy. Any authenticated user can obtain a signed read URL for any object in the bucket if they know the path.
 
+**Enrollment router is not mounted.** `routes/enrollments.ts` is fully implemented but has no corresponding `app.use(...)` line in `index.ts`. All `/v1/enrollments/*` endpoints return `404`. Add `app.use("/v1/enrollments", enrollmentsRouter)` to `index.ts` (and import the router) to restore enrollment functionality.
+
+**CORS is open to all origins.** The `origin: process.env.CORS_ORIGIN` line in `index.ts` is commented out and replaced with `origin: "*"`. This is acceptable for local emulator development but must be restricted before any production deployment that handles authenticated user data. Restore the commented `CORS_ORIGIN` block and set the env variable appropriately.
+
+**Certificate eligibility check uses `bestScore` field semantics that are pending confirmation.** The `POST /certificates` handler checks `activityProgress.bestScore !== 100` to determine eligibility. `bestScore` stores the raw proportional points value (not a percentage), but the eligibility check treats it as if it were a percentage. This works correctly today because `bestScore` and `bestScorePercent` happen to both equal 100 on a perfect attempt — but the field name is misleading and the check may break if activity scoring changes. The comment `// bestScore === 100 assumption — pending confirmation` in `certificates.ts` flags this explicitly.
+
 ---
 
 ## Adding a New Endpoint — Checklist
 
 When adding a new endpoint to the backend, work through this checklist to avoid common oversights.
 
-Decide which route file it belongs in, or create a new route file and mount it in `index.ts`. Apply the correct middleware — use `verifyToken` for all authenticated routes, add `requireRole('admin')` for admin-only operations, and add `checkEnrollment` for any route that accesses course-scoped content on behalf of a student. If the route is in a sub-router mounted under `/courses/:courseId/...`, ensure the router is created with `Router({ mergeParams: true })` so that `req.params.courseId` is accessible. Use the `success()` and `error()` utilities from `utils/response.ts` for all responses. Wrap the entire handler body in a `try/catch` and log structured context in the catch block — at minimum include `uid: req.user?.uid` and any relevant resource IDs. If the endpoint writes points, use `FieldValue.increment(n)` and call `checkAndAwardBadges` afterward. After implementing, rebuild with `npm run build` and verify the endpoint in the emulator before committing.
+Decide which route file it belongs in, or create a new route file and mount it in `index.ts`. **Mounting is a manual step** — a new route file that is not added to `index.ts` will silently return `404` with no build-time warning (the enrollment router is the current example of this trap).
+
+Apply the correct middleware — use `verifyToken` for all authenticated routes, add `requireRole('admin')` for admin-only operations, and add `checkEnrollment` for any route that accesses course-scoped content on behalf of a student. If the route is in a sub-router mounted under `/courses/:courseId/...`, ensure the router is created with `Router({ mergeParams: true })` so that `req.params.courseId` is accessible.
+
+Use the `success()` and `error()` utilities from `utils/response.ts` for all responses. Wrap the entire handler body in a `try/catch` and log structured context in the catch block — at minimum include `uid: req.user?.uid` and any relevant resource IDs.
+
+If the endpoint writes points, use `FieldValue.increment(n)` and call `checkAndAwardBadges` with the appropriate event type from the `BadgeEvent` union in `utils/badges.ts`. Map the returned badge IDs through `BADGE_REGISTRY` before including them in the response so clients receive full badge metadata.
+
+After implementing, rebuild with `npm run build` and verify the endpoint in the emulator before committing.

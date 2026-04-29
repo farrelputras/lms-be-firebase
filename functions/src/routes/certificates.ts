@@ -56,8 +56,7 @@ router.post("/", async (req, res) => {
       return;
     }
 
-    // Check gamification activity eligibility: all activities must have bestScore === 100
-    // bestScore === 100 assumption — pending confirmation of field semantics, O1
+    // Check gamification activity eligibility: all activities must have bestScorePercent === 100
     const gamificationSnap = await adminDb
       .collection("courses")
       .doc(courseId)
@@ -74,10 +73,10 @@ router.post("/", async (req, res) => {
           .doc(activityProgressId)
           .get();
 
-        // If activity progress not found or bestScore !== 100, not eligible
+        // If activity progress not found or bestScorePercent !== 100, not eligible
         if (
           !activityProgressSnap.exists ||
-          activityProgressSnap.data()?.bestScore !== 100
+          activityProgressSnap.data()?.bestScorePercent !== 100
         ) {
           res.status(403).json(
             error(

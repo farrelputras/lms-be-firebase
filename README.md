@@ -48,6 +48,7 @@ lms-be-firebase/
 │   │   │   ├── activities.ts
 │   │   │   ├── content.ts
 │   │   │   ├── certificates.ts
+│   │   │   ├── certificatesUser.ts   # GET /v1/certificates/me — all certs for current user
 │   │   │   ├── enrollments.ts        # ⚠️ file exists but NOT mounted in index.ts
 │   │   │   ├── progress.ts
 │   │   │   ├── storage.ts
@@ -102,7 +103,7 @@ Incoming request
  Router middleware              ← e.g. router.use(verifyToken) on the users router
       │
       ▼
- Route-specific middleware      ← e.g. checkEnrollment, requireRole on individual routes
+ Route-specific middleware      ← e.g. requirePublishedCourse, requireRole on individual routes
       │
       ▼
  Route handler                  ← The async function that reads req, calls Firestore, sends res
@@ -137,7 +138,7 @@ Behaves identically to `verifyToken` except it never blocks the request on failu
 
 **Location:** `src/middleware/requireRole.ts`
 
-Takes a role string as an argument and returns a middleware function. It requires `verifyToken` to have already run (it reads `req.user`). If `req.user` is undefined (unauthenticated), it sends `401`. If `req.user.role` does not match the required role, it sends `403`. Note that the current implementation checks for an exact role match — there is no role hierarchy (admin is not treated as a superset of instructor). If you need a route accessible to both admin and instructor, you would need to extend this middleware or add a second role check.
+Takes one or more role strings as arguments and returns a middleware function — for example `requireRole('admin')` or `requireRole('admin', 'instructor')`. It requires `verifyToken` to have already run (it reads `req.user`). If `req.user` is undefined (unauthenticated), it sends `401`. If `req.user.role` is not in the allowed list, it sends `403`. There is no role hierarchy — admin is not implicitly a superset of instructor. Use the variadic form when a route should be accessible to multiple distinct roles.
 
 **Used by:** Admin-only routes, either as `router.use(requireRole('admin'))` at the router level or as a per-route argument.
 
@@ -149,7 +150,21 @@ Verifies that the authenticated user is enrolled in the course identified by `re
 
 **Critical dependency:** This middleware reads `courseId` from `req.params.courseId`. It only works correctly on routes where the Express router has `mergeParams: true` set, because chapter and quiz routes are sub-routers mounted under `/courses/:courseId/...` — without `mergeParams: true`, `req.params.courseId` would be undefined in the child router. All course-scoped routers in this codebase already set `mergeParams: true`.
 
-**Used by:** Chapter GET routes, quiz GET routes, quiz submit route, and progress POST route.
+**Used by:** Not currently applied to any mounted route. The middleware is defined and functional, but all course-scoped content routes now use `requirePublishedCourse` instead. It will be reinstated once the enrollment router is mounted and enrollment-gated access is fully enforced.
+
+---
+
+### `requirePublishedCourse`
+
+**Location:** `src/middleware/requirePublishedCourse.ts`
+
+Verifies that the course identified by `req.params.courseId` exists and has `isPublished === true`. It requires `verifyToken` to have already run. Admin users bypass this check entirely — they can access unpublished courses for authoring and moderation. For all other roles, if the course does not exist or is not published, the middleware sends `404` (not `403`) — intentionally matching the behaviour of the courses GET endpoints to avoid leaking the existence of unpublished content.
+
+This middleware replaced `checkEnrollment` as the primary access gate on course-scoped student routes. Any authenticated student can now read chapters, quizzes, activities, and content for any published course regardless of enrollment status. Enrollment is tracked in the `enrollments` collection but is not currently enforced as an access gate on content routes.
+
+**Critical dependency:** Like `checkEnrollment`, this middleware reads `courseId` from `req.params.courseId` and therefore only works correctly on sub-routers with `mergeParams: true` set.
+
+**Used by:** Chapter GET routes, quiz GET routes, quiz submit route, all activity routes, content GET route, and progress routes.
 
 ---
 
@@ -164,13 +179,14 @@ The mounting tree in `index.ts` looks like this:
 /v1/auth                                  → routes/auth.ts
 /v1/users                                 → routes/users.ts        (router.use(verifyToken, requireRole('admin')))
 /v1/courses                               → routes/courses.ts
-/v1/courses/:courseId/chapters            → routes/chapters.ts     (mergeParams: true)
-/v1/courses/:courseId/quizzes             → routes/quizzes.ts      (mergeParams: true)
-/v1/courses/:courseId/activities          → routes/activities.ts   (mergeParams: true)
-/v1/courses/:courseId/content             → routes/content.ts      (mergeParams: true, requires enrollment)
-/v1/courses/:courseId/progress            → routes/progress.ts     (mergeParams: true, router.use(verifyToken))
-/v1/courses/:courseId/certificates        → routes/certificates.ts (mergeParams: true, router.use(verifyToken))
-/v1/storage                               → routes/storage.ts      (router.use(verifyToken))
+/v1/courses/:courseId/chapters            → routes/chapters.ts       (mergeParams: true, requirePublishedCourse)
+/v1/courses/:courseId/quizzes             → routes/quizzes.ts        (mergeParams: true, requirePublishedCourse)
+/v1/courses/:courseId/activities          → routes/activities.ts     (mergeParams: true, requirePublishedCourse)
+/v1/courses/:courseId/content             → routes/content.ts        (mergeParams: true, requirePublishedCourse)
+/v1/courses/:courseId/progress            → routes/progress.ts       (mergeParams: true, router.use(verifyToken))
+/v1/courses/:courseId/certificates        → routes/certificates.ts   (mergeParams: true, router.use(verifyToken))
+/v1/certificates                          → routes/certificatesUser.ts (router.use(verifyToken))
+/v1/storage                               → routes/storage.ts        (router.use(verifyToken))
 /v1/leaderboard                           → routes/leaderboard.ts
 /v1/media                                 → routes/media.ts
 
@@ -326,8 +342,6 @@ If `COURSE_ID` is not set, the script falls back to a hardcoded default value. A
 
 These are issues in the current implementation that the next developer to touch the codebase should be aware of. They are ordered by production risk, not by effort to fix.
 
-**Missing Firestore composite index for leaderboard.** The `GET /leaderboard` handler queries `users` with `where('isActive', '==', true)` combined with `orderBy('totalPoints', 'desc')`. This requires a composite index that is not currently present in `firestore.indexes.json`. The query works in the local emulator (which does not enforce index requirements) but will fail in production with a Firestore error. This must be created and deployed before any production launch.
-
 **Firestore security rules use stale collection name.** The rules file references `quizResults` (camelCase). The route now writes to `quiz_results` (snake_case). Any client-side Firestore access to `quiz_results` will be denied until the rules are updated. Since the current frontend uses the backend API exclusively and does not query Firestore directly, this is not currently causing visible failures — but it is a trap waiting for the next developer who tries to add a client-side Firestore listener.
 
 **Quiz question schema drift between admin write and student read.** Questions are stored in Firestore with `questionText` as the field name for question text. The admin create/update interface models the field as `question` in the TypeScript `QuizQuestion` interface. The student normalization function correctly reads `questionText` from the stored document. However, if an admin client submits a question object using `question` instead of `questionText`, the data is stored with the wrong field name and students will see blank questions. The TypeScript interface and the stored schema are out of sync, and there is no runtime validation that catches this mismatch.
@@ -336,7 +350,7 @@ These are issues in the current implementation that the next developer to touch 
 
 **`top_3` badge query does not filter inactive users.** The `checkAndAwardBadges` utility queries users by `totalPoints` without filtering `isActive=true`. An inactive (soft-deleted) user with a high point total can occupy a top-3 slot and prevent an active user from earning the `top_3` badge, even though the inactive user does not appear on the visible leaderboard. The fix is to add `.where('isActive', '==', true)` to the query in `badges.ts` — but be aware this will also require the same composite index as the leaderboard query.
 
-**Progress GET is not enrollment-gated.** `GET /courses/:courseId/progress` applies `verifyToken` but not `checkEnrollment`. Any authenticated user can read the progress of any course, whether or not they are enrolled. This may be intentional — reading progress for an unenrolled course is harmless since there will be nothing there — but it is inconsistent with the chapter and quiz GET routes which do enforce enrollment. A product decision should be made and documented either way.
+**No content route enforces enrollment.** All course-scoped student routes — chapters, quizzes, activities, content, and progress — gate access on `requirePublishedCourse` (course exists and is published) rather than enrollment. Any authenticated student can read the content of any published course regardless of whether they have an `enrollments` document. This is a deliberate MVP simplification; if enrollment-gated access is required before launch, `checkEnrollment` needs to be reinstated on the relevant routes and the enrollment router must also be mounted.
 
 **Storage download path override is broad.** `GET /storage/download-url/:fileId` accepts a `?path=` query parameter that, if provided, overrides the `:fileId` param and signs any existing GCS path for any authenticated user. There is no ownership check or path boundary policy. Any authenticated user can obtain a signed read URL for any object in the bucket if they know the path.
 
@@ -354,7 +368,7 @@ When adding a new endpoint to the backend, work through this checklist to avoid 
 
 Decide which route file it belongs in, or create a new route file and mount it in `index.ts`. **Mounting is a manual step** — a new route file that is not added to `index.ts` will silently return `404` with no build-time warning (the enrollment router is the current example of this trap).
 
-Apply the correct middleware — use `verifyToken` for all authenticated routes, add `requireRole('admin')` for admin-only operations, and add `checkEnrollment` for any route that accesses course-scoped content on behalf of a student. If the route is in a sub-router mounted under `/courses/:courseId/...`, ensure the router is created with `Router({ mergeParams: true })` so that `req.params.courseId` is accessible.
+Apply the correct middleware — use `verifyToken` for all authenticated routes, add `requireRole('admin')` for admin-only operations, and add `requirePublishedCourse` for any route that accesses course-scoped content on behalf of a student (this gates on publication status, not enrollment). If the route is in a sub-router mounted under `/courses/:courseId/...`, ensure the router is created with `Router({ mergeParams: true })` so that `req.params.courseId` is accessible to both the route handler and `requirePublishedCourse`.
 
 Use the `success()` and `error()` utilities from `utils/response.ts` for all responses. Wrap the entire handler body in a `try/catch` and log structured context in the catch block — at minimum include `uid: req.user?.uid` and any relevant resource IDs.
 

@@ -22,6 +22,7 @@ This guide is written for frontend developers (web or mobile) consuming the LMS 
 - [Course Content Endpoint](#course-content-endpoint)
 - [Progress Endpoints](#progress-endpoints) — mark complete, get progress, reset (dev only)
 - [Certificate Endpoints](#certificate-endpoints)
+- [User Certificate Endpoint](#user-certificate-endpoint) — all certs across courses
 - [Enrollment Endpoints](#enrollment-endpoints) ⚠️ currently unmounted — see section
 - [Leaderboard Endpoint](#leaderboard-endpoint)
 - [Storage Endpoints](#storage-endpoints)
@@ -247,7 +248,7 @@ Partial update — only include the fields you want to change. To publish a cour
 
 ## Chapter Endpoints
 
-All chapter routes are nested under `/v1/courses/:courseId/chapters`. Every student request to these routes requires the user to be **enrolled in the course** — unenrolled students receive a `403`.
+All chapter routes are nested under `/v1/courses/:courseId/chapters`. Every student request to these routes requires the user to be **authenticated and the course to be published**. Unauthenticated requests receive `401`; requests to an unpublished or non-existent course receive `404`.
 
 ### List chapters — `GET /v1/courses/:courseId/chapters`
 
@@ -269,7 +270,7 @@ Partial update. If you omit `isPublished` from the body, the existing value is p
 
 ## Quiz Endpoints
 
-All quiz routes are nested under `/v1/courses/:courseId/quizzes`. Student requests require enrollment in the course.
+All quiz routes are nested under `/v1/courses/:courseId/quizzes`. Student requests require authentication and the course to be published.
 
 ### What students see vs what admins see
 
@@ -344,7 +345,7 @@ After receiving a submit response, call `GET /auth/me` to refresh the user's ful
 
 ## Activity Endpoints
 
-All activity routes are nested under `/v1/courses/:courseId/activities`. Student requests require enrollment. Activities are stored in the `gamification` subcollection under a course document.
+All activity routes are nested under `/v1/courses/:courseId/activities`. Student requests require authentication and the course to be published. Activities are stored in the `gamification` subcollection under a course document.
 
 There are three activity types: `drag_drop`, `word_search`, and `true_or_false`. The type is fixed at creation and cannot be changed via update.
 
@@ -409,7 +410,7 @@ Response on success: `{ "activityId": "<newId>" }` with HTTP 201.
 
 ### Get an activity — `GET /v1/courses/:courseId/activities/:activityId`
 
-Returns the activity. Requires enrollment. **Correct answer data is stripped for students** — the same pattern as quizzes:
+Returns the activity. Requires authentication and the course to be published. **Correct answer data is stripped for students** — the same pattern as quizzes:
 - `drag_drop`: each item returns only `{ id, label }` — `correctCategory` is removed
 - `true_or_false`: each statement returns only `{ id, text }` — `correct` is removed
 - `word_search`: full data is returned (no answers to strip)
@@ -495,7 +496,7 @@ Deletes the activity and **cascades**: all `activity_progress` documents for tha
 
 ### Get course content — `GET /v1/courses/:courseId/content`
 
-Returns a unified, ordered list of all chapters and activities for a course. Requires enrollment. This is the primary endpoint for rendering the course sidebar or table of contents — it replaces calling `GET /chapters` and `GET /activities` separately.
+Returns a unified, ordered list of all chapters and activities for a course. Requires authentication and the course to be published. This is the primary endpoint for rendering the course sidebar or table of contents — it replaces calling `GET /chapters` and `GET /activities` separately.
 
 Each item in the array includes `itemType` (`"chapter"` or `"activity"`), `completed`, and `locked` fields in addition to the item's own data. Items are sorted by `position` ascending. Activities with sensitive fields (`correctCategory`, `correct`) are already stripped in this response.
 
@@ -670,6 +671,35 @@ Returns the student's existing certificate for the course. Does not issue a new 
 
 ---
 
+## User Certificate Endpoint
+
+### Get all my certificates — `GET /v1/certificates/me`
+
+Requires authentication. Returns all certificates the current user has received across every course, ordered by issue date descending. This is distinct from `GET /v1/courses/:courseId/certificates/me` — that retrieves the certificate for a single specific course; this retrieves the full list across all courses in one call.
+
+```json
+// Response
+{
+  "success": true,
+  "data": [
+    {
+      "id": "abc123xyz_3bViFooKRQSBQxVLjGIJ",
+      "userId": "abc123xyz",
+      "courseId": "3bViFooKRQSBQxVLjGIJ",
+      "userName": "Budi Santoso",
+      "courseName": "Pengantar Ekonomi Syariah",
+      "serialNumber": "CERT-3BVIF-ABC12-20260428",
+      "issuedAt": "2026-04-28T10:00:00.000Z",
+      "completionDate": "2026-04-28"
+    }
+  ]
+}
+```
+
+Returns an empty array if the user has no certificates yet. Use this to populate the student's achievements page or profile without issuing per-course queries.
+
+---
+
 ## Enrollment Endpoints
 
 > ⚠️ **Known issue:** The enrollment router is currently not mounted in the backend entry point. All `/v1/enrollments/*` endpoints will return `404` until this is fixed. Do not build enrollment flows against the current production build — check with the backend team before using these routes.
@@ -729,6 +759,26 @@ Returns a signed read URL valid for 1 hour. The `:fileId` is the file path in Cl
 
 ## Media Endpoints
 
+### Upload a thumbnail image — `POST /v1/media/upload` *(admin only)*
+
+Uploads an image file directly to Cloud Storage via a multipart form upload. The backend streams the file using busboy and stores it at `thumbnails/{uuid}.{ext}`. The response contains a **permanent public URL** — it does not expire.
+
+Send the request as `multipart/form-data` with the image in any field name. Do not set `Content-Type: application/json`.
+
+```json
+// Response (HTTP 201)
+{
+  "success": true,
+  "data": {
+    "imageUrl": "https://firebasestorage.googleapis.com/v0/b/your-bucket/o/thumbnails%2Fuuid.jpg?alt=media"
+  }
+}
+```
+
+Use the returned `imageUrl` as the `thumbnailUrl` when creating or updating a course. **Choose between the two upload patterns based on where the file lives:**
+- Use `POST /v1/media/upload` when the image file is already in the client and you want the server to handle the stream.
+- Use `POST /v1/storage/upload-url` when you want the client to upload directly to GCS (a signed write URL is returned; the binary never passes through the backend).
+
 ### Resolve a media path to a view URL — `GET /v1/media/view?path=<filePath>`
 
 Returns a redirect to a signed read URL by default. This lets clients render media using a backend URL while keeping storage provider details hidden behind backend contracts.
@@ -751,7 +801,7 @@ JSON behavior (`redirect=0`):
 }
 ```
 
-This endpoint currently validates path format and existence, then signs a read URL for 1 hour.
+This endpoint validates path format and existence, then signs a read URL for 1 hour.
 
 ---
 
@@ -803,5 +853,7 @@ These are subtle behaviours that are easy to miss and hard to debug once you hit
 **`progressPercentage` only appears for authenticated users on `GET /v1/courses`.** Unauthenticated responses omit this field entirely — do not default it to `0` if it is absent, as that may indicate the user is simply not logged in rather than having zero progress.
 
 **Certificate eligibility requires a perfect score on every activity, not just completion.** A student who has `completed: true` on all activities but whose `bestScore` is less than 100 on any one of them will receive `403 CERTIFICATE_NOT_ELIGIBLE` when calling `POST /certificates`. Completion and perfect score are tracked separately. Make sure your UI distinguishes "activity completed" from "activity perfected" if you want to show certificate eligibility progress.
+
+**Chapters, quizzes, and activities are not enrollment-gated.** Any authenticated student can read content from any published course — they do not need to be enrolled. The access gate on all content routes is `requirePublishedCourse` (course exists and `isPublished === true`), not enrollment. Enrollment is tracked in the database but is not currently enforced as an access gate.
 
 **Enrollment endpoints are currently unreachable.** The enrollment router exists in the backend but is not mounted. All `/v1/enrollments/*` calls will return `404`. Wait for the backend fix before implementing enrollment UI flows.

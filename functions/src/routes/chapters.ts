@@ -76,10 +76,11 @@ router.post(
   async (req, res) => {
     try {
       const courseId = req.params.courseId as string;
-      const {title, content, videoUrl, order, isPublished} = req.body as {
+      const {title, content, mediaType, mediaUrl, order, isPublished} = req.body as {
         title?: string;
         content?: string;
-        videoUrl?: string;
+        mediaType?: string;
+        mediaUrl?: string;
         order?: number;
         isPublished?: boolean;
       };
@@ -94,7 +95,8 @@ router.post(
       const chapterData = {
         title,
         content: content || "",
-        videoUrl: videoUrl || "",
+        mediaType: mediaType || "youtube",
+        mediaUrl: mediaUrl || "",
         order: order ?? 0,
         isPublished: isPublished ?? false,
         createdAt: FieldValue.serverTimestamp(),
@@ -124,10 +126,11 @@ router.patch(
     try {
       const courseId = req.params.courseId as string;
       const chapterId = req.params.chapterId as string;
-      const {title, content, videoUrl, order, isPublished} = req.body as {
+      const {title, content, mediaType, mediaUrl, order, isPublished} = req.body as {
         title?: string;
         content?: string;
-        videoUrl?: string;
+        mediaType?: string;
+        mediaUrl?: string;
         order?: number;
         isPublished?: boolean;
       };
@@ -135,7 +138,8 @@ router.patch(
       const updates: Record<string, unknown> = {};
       if (title !== undefined) updates.title = title;
       if (content !== undefined) updates.content = content;
-      if (videoUrl !== undefined) updates.videoUrl = videoUrl;
+      if (mediaType !== undefined) updates.mediaType = mediaType || "youtube";
+      if (mediaUrl !== undefined) updates.mediaUrl = mediaUrl;
       if (order !== undefined) updates.order = order;
       if (isPublished !== undefined) updates.isPublished = isPublished;
 

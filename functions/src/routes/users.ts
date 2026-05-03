@@ -100,20 +100,43 @@ router.patch("/:uid", async (req, res) => {
   }
 });
 
-// DELETE /users/:uid — disable Auth user + mark Firestore doc inactive
+// DELETE /users/:uid — hard-delete from Auth + cascade Firestore cleanup
 router.delete("/:uid", async (req, res) => {
+  const {uid} = req.params;
   try {
-    const {uid} = req.params;
-    await adminAuth.updateUser(uid, {disabled: true});
-    await adminDb.collection("users").doc(uid).update({
-      isActive: false,
-      updatedAt: FieldValue.serverTimestamp(),
-    });
-    res.json(success({uid, isActive: false}));
-  } catch {
-    res.status(500).json(
-      error("DELETE_FAILED", "Failed to delete user")
-    );
+    await adminAuth.deleteUser(uid);
+
+    const COLLECTIONS = [
+      "enrollments",
+      "progress",
+      "quiz_results",
+      "activity_progress",
+      "certificates",
+    ];
+
+    const refs: FirebaseFirestore.DocumentReference[] = [
+      adminDb.collection("users").doc(uid),
+    ];
+
+    for (const col of COLLECTIONS) {
+      const snap = await adminDb
+        .collection(col)
+        .where("userId", "==", uid)
+        .get();
+      snap.docs.forEach((d) => refs.push(d.ref));
+    }
+
+    const CHUNK = 499;
+    for (let i = 0; i < refs.length; i += CHUNK) {
+      const batch = adminDb.batch();
+      refs.slice(i, i + CHUNK).forEach((ref) => batch.delete(ref));
+      await batch.commit();
+    }
+
+    res.json(success({uid}));
+  } catch (err) {
+    console.error("[DELETE user]", uid, err);
+    res.status(500).json(error("DELETE_FAILED", "Failed to delete user"));
   }
 });
 

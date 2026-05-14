@@ -75,13 +75,14 @@ router.get("/:uid", async (req, res) => {
 router.patch("/:uid", async (req, res) => {
   try {
     const {uid} = req.params;
-    const {name, email} = req.body as {name?: string; email?: string};
+    const {name, email, totalPoints} = req.body as {name?: string; email?: string; totalPoints?: number};
 
     const updates: Record<string, unknown> = {
       updatedAt: FieldValue.serverTimestamp(),
     };
     if (name !== undefined) updates.name = name;
     if (email !== undefined) updates.email = email;
+    if (totalPoints !== undefined) updates.totalPoints = totalPoints;
 
     await adminDb.collection("users").doc(uid).update(updates);
 

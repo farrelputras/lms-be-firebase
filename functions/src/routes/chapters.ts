@@ -108,6 +108,10 @@ router.post(
         .collection("chapters")
         .add(chapterData);
 
+      await adminDb.collection("courses").doc(courseId).update({
+        totalChapters: FieldValue.increment(1),
+      });
+
       res.status(201).json(success({id: docRef.id, ...chapterData}));
     } catch {
       res.status(500).json(
@@ -186,6 +190,10 @@ router.delete(
         .collection("chapters")
         .doc(chapterId)
         .delete();
+
+      await adminDb.collection("courses").doc(courseId).update({
+        totalChapters: FieldValue.increment(-1),
+      });
 
       res.json(success({id: chapterId, deleted: true}));
     } catch {

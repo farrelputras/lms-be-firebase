@@ -255,6 +255,10 @@ router.post("/", verifyToken, requireRole("admin"), async (req, res) => {
       updatedAt: FieldValue.serverTimestamp(),
     });
 
+    await adminDb.collection("courses").doc(courseId).update({
+      totalActivities: FieldValue.increment(1),
+    });
+
     res.status(201).json(success({activityId: docRef.id}));
   } catch (err: unknown) {
     console.error({
@@ -735,6 +739,11 @@ router.delete(
       });
 
       await batch.commit();
+
+      await adminDb.collection("courses").doc(courseId).update({
+        totalActivities: FieldValue.increment(-1),
+      });
+
       res.json(success({message: "Activity deleted"}));
     } catch (err: unknown) {
       console.error({

@@ -114,6 +114,7 @@ router.post(
         description: description || "",
         thumbnailUrl: thumbnailUrl || "",
         isPublished: isPublished ?? false,
+        totalChapters: 0,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       };

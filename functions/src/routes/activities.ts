@@ -6,6 +6,7 @@ import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
 import {requirePublishedCourse} from "../middleware/requirePublishedCourse.js";
 import {checkAndAwardBadges, BADGE_REGISTRY} from "../utils/badges.js";
+import {recalculateCourseProgress} from "../utils/courseProgress.js";
 import {success, error} from "../utils/response.js";
 
 type ActivityType = "drag_drop" | "word_search" | "true_or_false";
@@ -570,6 +571,9 @@ router.post(
         lastAttemptAt: FieldValue.serverTimestamp(),
         completed: true,
       }, {merge: true});
+
+      // Roll the completed activity into the course-level progress percentage.
+      await recalculateCourseProgress(uid, courseId);
 
       if (pointsDelta > 0) {
         const userRef = adminDb.collection("users").doc(uid);

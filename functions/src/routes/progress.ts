@@ -5,6 +5,7 @@ import {adminDb} from "../firebaseAdmin.js";
 import {requirePublishedCourse} from "../middleware/requirePublishedCourse.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {checkAndAwardBadges, BADGE_REGISTRY} from "../utils/badges.js";
+import {recalculateCourseProgress} from "../utils/courseProgress.js";
 import {success, error} from "../utils/response.js";
 
 const router = Router({mergeParams: true});
@@ -47,15 +48,6 @@ router.post("/", requirePublishedCourse, async (req, res) => {
     let isNewCompletion = false;
     let completed: string[] = [];
 
-    // Count total chapters for percentage calculation
-    const chaptersSnap = await adminDb
-      .collection("courses")
-      .doc(courseId)
-      .collection("chapters")
-      .get();
-    const totalChapters = chaptersSnap.size;
-    let percentage = 0;
-
     if (existing.exists) {
       const data = existing.data();
       completed =
@@ -65,33 +57,24 @@ router.post("/", requirePublishedCourse, async (req, res) => {
         isNewCompletion = true;
       }
 
-      percentage =
-        totalChapters > 0 ?
-          Math.round((completed.length / totalChapters) * 100) :
-          0;
-
       await progressRef.update({
         completedChapters: completed,
-        percentage,
         updatedAt: FieldValue.serverTimestamp(),
       });
     } else {
       completed = [chapterId];
       isNewCompletion = true;
 
-      percentage =
-        totalChapters > 0 ?
-          Math.round((1 / totalChapters) * 100) :
-          0;
-
       await progressRef.set({
         userId: uid,
         courseId,
         completedChapters: completed,
-        percentage,
         updatedAt: FieldValue.serverTimestamp(),
       });
     }
+
+    // Recompute combined percentage (chapters + activities) atomically.
+    const percentage = await recalculateCourseProgress(uid, courseId);
 
     let pointsAwarded = 0;
     // Changed to an array of objects to pass the full Material UI data to Flutter

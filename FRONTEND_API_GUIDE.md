@@ -15,6 +15,7 @@ This guide is written for frontend developers (web or mobile) consuming the LMS 
 - [The Response Envelope](#the-response-envelope)
 - [Error Handling](#error-handling)
 - [Auth Endpoints](#auth-endpoints)
+- [User Management Endpoints](#user-management-endpoints) *(admin only)*
 - [Course Endpoints](#course-endpoints)
 - [Chapter Endpoints](#chapter-endpoints)
 - [Quiz Endpoints](#quiz-endpoints)
@@ -87,7 +88,7 @@ An error response always looks like this:
 }
 ```
 
-Because the envelope is consistent, you can write a single wrapper function in your API client that checks `success` first and either returns `data` or throws an error using `error.code`. This is much cleaner than checking HTTP status codes in every individual API call.
+Because the envelope is consistent, you can write a single wrapper function in your API client layer that checks `success` first and either returns `data` or throws an error using `error.code`. This is much cleaner than checking HTTP status codes in every individual API call.
 
 ```javascript
 // Suggested API client wrapper pattern
@@ -127,6 +128,7 @@ The following error codes appear across multiple endpoints. Each endpoint sectio
 | `403` | `FORBIDDEN` | The user is authenticated but does not have permission. Show an access denied message. |
 | `403` | `LOCKED` | The activity is locked because the previous item has not been completed. Show a "complete previous item" prompt — this is distinct from a permission error. |
 | `404` | `NOT_FOUND` | The resource does not exist, or is hidden for access control reasons (e.g. unpublished course). |
+| `409` | `CONFLICT` | A duplicate resource already exists (e.g. enrolling in a course you are already enrolled in). |
 | `500` | `*_FAILED` | Something went wrong on the server. Log the error and show a generic retry message. |
 
 One important nuance on `404`: when a non-admin requests an unpublished course, the API returns `404` rather than `403`. This is intentional — it prevents the frontend from leaking information about the existence of unpublished content. Treat all `404` responses the same way regardless of why they were returned.
@@ -149,7 +151,7 @@ Creates a Firebase Auth account, assigns the `student` role, and creates the use
 ```
 
 ```json
-// Response
+// Response (HTTP 201)
 {
   "success": true,
   "data": {
@@ -171,7 +173,7 @@ Creates a Firebase Auth account, assigns the `student` role, and creates the use
 
 ### Sync current user + claims — `POST /v1/auth/sync`
 
-Requires authentication. This endpoint ensures a Firestore user profile exists for the authenticated Firebase user, syncs custom claims from Firestore role, and may return newly awarded onboarding badges.
+Requires authentication. This endpoint ensures a Firestore user profile exists for the authenticated Firebase user, syncs custom claims from Firestore role, and may return newly awarded onboarding badges. Call this immediately after any OAuth or social login flow where the user may not have a Firestore profile yet.
 
 ```json
 // Optional request body
@@ -182,7 +184,7 @@ Requires authentication. This endpoint ensures a Firestore user profile exists f
 ```
 
 ```json
-// Response
+// Response (HTTP 201)
 {
   "success": true,
   "data": {
@@ -193,6 +195,8 @@ Requires authentication. This endpoint ensures a Firestore user profile exists f
   }
 }
 ```
+
+Note: this endpoint always returns HTTP 201, even when the user profile already existed and no changes were made.
 
 ### Assign a role — `POST /v1/auth/assign-role` *(admin only)*
 
@@ -220,13 +224,73 @@ Returns the full profile of the currently authenticated user. Call this after lo
 
 ---
 
+## User Management Endpoints
+
+All user management routes require an admin token. They are protected at the router level — every route under `/v1/users` is admin-only with no exceptions.
+
+### List users — `GET /v1/users`
+
+Returns all user profiles. Supports two optional query parameters:
+- `?role=student` — filter by role (`student`, `instructor`, `admin`)
+- `?search=budi` — case-insensitive substring match against name or email
+
+```json
+// Response
+{
+  "success": true,
+  "data": [
+    { "uid": "abc123", "name": "Budi Santoso", "email": "budi@example.com", "role": "student", "totalPoints": 42, "badges": [], "isActive": true }
+  ]
+}
+```
+
+### Get a user — `GET /v1/users/:uid`
+
+Returns a single user document. Returns `404` with code `NOT_FOUND` if the user does not exist.
+
+### Update a user — `PATCH /v1/users/:uid` *(admin only)*
+
+Partial update. Accepted fields: `name`, `email`, `totalPoints`. If `email` or `name` is provided, the Firebase Auth record is also updated.
+
+```json
+// Example: override a student's point total
+{ "totalPoints": 100 }
+```
+
+`totalPoints` is set to the provided value directly — this is not an increment operation. Use this only for admin corrections; normal point accumulation goes through the gamification route handlers.
+
+### Delete a user — `DELETE /v1/users/:uid` *(admin only)*
+
+**This is a permanent, irreversible hard delete.** It:
+1. Deletes the Firebase Auth account for the user
+2. Deletes the `users/{uid}` Firestore document
+3. Deletes all Firestore documents where `userId == uid` across: `enrollments`, `progress`, `quiz_results`, `activity_progress`, `certificates`
+
+There is no soft-delete or undo path. Confirm with the user before triggering this from an admin UI.
+
+```json
+// Response
+{ "success": true, "data": { "uid": "abc123" } }
+```
+
+### Upsert a user profile — `POST /v1/users/upsert` *(admin only)*
+
+Creates a user document if one does not exist, or updates the `email` and `name` fields if it does. This is a backward-compatibility endpoint for sync flows that do not go through `/auth/register` or `/auth/sync`. Requires `uid` and `email` in the request body.
+
+```json
+// Request body
+{ "uid": "abc123", "email": "user@example.com", "displayName": "Budi Santoso" }
+```
+
+---
+
 ## Course Endpoints
 
 ### List courses — `GET /v1/courses`
 
 No token required. If the user is not authenticated, only published courses are returned. If the user is an admin, all courses (including unpublished) are returned. This means you can call this endpoint before the user logs in to show a course catalog.
 
-**For authenticated users only:** each course object in the array also includes a `progressPercentage` field (integer 0–100). This is batch-loaded server-side in a single query — you do not need to call the progress endpoint separately to populate a course list. Unauthenticated responses do not include this field.
+**For authenticated users only:** each course object in the array also includes a `progressPercentage` field (integer 0–100). This value reflects combined progress across both chapters and activities — it is not chapters-only. This is batch-loaded server-side in a single query — you do not need to call the progress endpoint separately to populate a course list. Unauthenticated responses do not include this field.
 
 ### Get a single course — `GET /v1/courses/:courseId`
 
@@ -260,11 +324,22 @@ Chapter completion is handled by the progress endpoint, not the chapters endpoin
 
 ### Create a chapter — `POST /v1/courses/:courseId/chapters` *(admin only)*
 
-The `isPublished` field controls visibility. It defaults to `false` if you omit it. The `isFree` field is **intentionally excluded** from this MVP — do not send it.
+The `isPublished` field controls visibility. It defaults to `false` if you omit it. The `isFree` field is **intentionally excluded** from this MVP — do not send it. Creating a chapter increments the `totalChapters` counter on the course document.
+
+Chapter media is stored as two separate fields — do **not** use the old `videoUrl` field:
+
+| Field | Type | Notes |
+|---|---|---|
+| `mediaType` | string | Media provider type, e.g. `"youtube"`. Defaults to `"youtube"` if omitted. |
+| `mediaUrl` | string | The URL of the media. |
 
 ### Update a chapter — `PATCH /v1/courses/:courseId/chapters/:chapterId` *(admin only)*
 
 Partial update. If you omit `isPublished` from the body, the existing value is preserved. This means you can safely update `title` without accidentally unpublishing a live chapter.
+
+### Delete a chapter — `DELETE /v1/courses/:courseId/chapters/:chapterId` *(admin only)*
+
+Deletes the chapter and decrements the `totalChapters` counter on the course document.
 
 ---
 
@@ -297,6 +372,14 @@ This is the most important thing to understand about quiz endpoints. The questio
 
 When writing question objects, use `questionText` as the field name for the question text — not `question`. The student normalization reads from `questionText`. If you accidentally use `question`, students will see blank question text. This is the single most important naming rule in the entire API.
 
+### Update a quiz — `PATCH /v1/courses/:courseId/quizzes/:quizId` *(admin only)*
+
+Partial update. Send only the fields you want to change (`title`, `questions`, or both).
+
+### Delete a quiz — `DELETE /v1/courses/:courseId/quizzes/:quizId` *(admin only)*
+
+Deletes the quiz document. Does not cascade to `quiz_results`.
+
 ### Submit quiz answers — `POST /v1/courses/:courseId/quizzes/:quizId/submit`
 
 This is the most complex endpoint in the API. It scores answers server-side, awards points, checks badge eligibility, and returns the full result in one response.
@@ -322,6 +405,12 @@ This is the most complex endpoint in the API. It scores answers server-side, awa
     "pointsAwarded": 3,
     "earnedBadges": [
       {
+        "id": "active_learner",
+        "name": "Active Learner",
+        "icon": "auto_stories",
+        "color": "orange"
+      },
+      {
         "id": "perfect_score",
         "name": "Perfect Score",
         "icon": "verified",
@@ -337,7 +426,9 @@ This is the most complex endpoint in the API. It scores answers server-side, awa
 }
 ```
 
-The `passed` field is `true` **only when the student answered every question correctly** (100%). It is `false` for any partial score, including 19 out of 20. Use this field to drive the perfect score UI state. The `pointsAwarded` field always equals `score` — one point per correct answer. Points are awarded on every submission including retakes, so a student who retakes a quiz earns points each time. The `earnedBadges` array contains only badges newly awarded on this specific submission and includes metadata (`id`, `name`, `icon`, `color`).
+The `passed` field is `true` **only when the student answered every question correctly** (100%). It is `false` for any partial score, including 19 out of 20. Use this field to drive the perfect score UI state. The `pointsAwarded` field always equals `score` — one point per correct answer. Points are awarded on every submission including retakes, so a student who retakes a quiz earns points each time.
+
+Quiz submissions now trigger the same badge checks as activity submissions. `earnedBadges` will always include `active_learner` on the first time that badge is earned, and will include `perfect_score` if the student answered every question correctly. It may also include `top_3` or `number_1` if the student's new point total places them in the leaderboard top 3.
 
 After receiving a submit response, call `GET /auth/me` to refresh the user's full profile state so that `totalPoints` and `badges` are up to date in your UI.
 
@@ -405,6 +496,10 @@ Each type then requires its own additional fields:
   "feedbackMode": "immediate"
 }
 ```
+
+**Important:** Each statement in a `true_or_false` activity must have a non-empty `id`. Activities created with empty `id` strings on statements are handled with a fallback key on the submit side (`__statement_0`, `__statement_1`, etc.), but this is a backward-compatibility measure — always provide meaningful IDs when creating activities.
+
+Creating an activity increments the `totalActivities` counter on the course document.
 
 Response on success: `{ "activityId": "<newId>" }` with HTTP 201.
 
@@ -475,6 +570,8 @@ The answer format differs by activity type.
 
 `isNewCompletion` is `true` on the first submission only. Use it to decide whether to trigger a course-progress animation. The activity is marked `completed: true` on the first submission and stays that way regardless of future scores.
 
+After submission, the backend automatically recomputes the course progress percentage (combining chapters + activities) and writes it to the progress document. You do not need to call any separate progress endpoint to refresh the percentage — it will be up to date on the next call to `GET /v1/courses/:courseId/progress` or `GET /v1/courses`.
+
 `feedback` shape differs by type:
 - `drag_drop`: `[{ id, correct, correctCategory }]`
 - `word_search`: `[{ word, found }]`
@@ -488,7 +585,7 @@ Partial update. Only include fields you want to change. The activity `type` cann
 
 ### Delete an activity — `DELETE /v1/courses/:courseId/activities/:activityId` *(admin only)*
 
-Deletes the activity and **cascades**: all `activity_progress` documents for that activity are deleted in the same batch.
+Deletes the activity and **cascades**: all `activity_progress` documents for that activity are deleted in the same batch. Also decrements the `totalActivities` counter on the course document.
 
 ---
 
@@ -557,7 +654,7 @@ Marks a chapter as completed for the calling user. The `courseId` goes in the UR
 ```
 
 ```json
-// Response
+// Response — HTTP 201 on first completion, HTTP 200 on subsequent calls
 {
   "success": true,
   "data": {
@@ -569,11 +666,15 @@ Marks a chapter as completed for the calling user. The `courseId` goes in the UR
 }
 ```
 
-The `pointsAwarded` field is `10` on the first completion of a chapter and `0` on any subsequent call with the same chapter. Use this field to decide whether to show a "+10 points" animation — if `pointsAwarded` is `0`, the user already completed this chapter before and you should not show the animation again. The `percentage` is an integer from 0 to 100 representing how many of the course's chapters have been completed.
+**`percentage`** is the combined completion percentage across both chapters and activities — it is not chapters-only. A course with 2 chapters and 2 activities at 50% means 2 of the 4 total items have been completed. Use this value to drive the course progress bar.
+
+The `pointsAwarded` field is `10` on the first completion of a chapter and `0` on any subsequent call with the same chapter. Use this field to decide whether to show a "+10 points" animation — if `pointsAwarded` is `0`, the user already completed this chapter before and you should not show the animation again.
+
+The response HTTP status is `201` on the first time a chapter is marked complete for this student, and `200` on subsequent calls. Use this to distinguish first-completion celebrations from idempotent re-submissions if needed.
 
 ### Get progress for a course — `GET /v1/courses/:courseId/progress`
 
-Returns the user's progress for a course. If the user has not completed any chapters yet, returns an empty default rather than a `404` — so this endpoint is always safe to call without checking enrollment first.
+Returns the user's progress for a course. The `percentage` field reflects combined chapter + activity completion. If the user has not completed any items yet, returns an empty default rather than a `404` — so this endpoint is always safe to call without checking enrollment first.
 
 ### Reset all progress — `DELETE /v1/courses/:courseId/progress` *(dev/testing only)*
 
@@ -610,14 +711,16 @@ All certificate routes are nested under `/v1/courses/:courseId/certificates`. Ev
 
 A certificate can only be issued when **both** of the following are true:
 
-1. The student's `progress` document for the course has `percentage === 100` (all chapters completed).
-2. Every activity in the course's `gamification` subcollection has a corresponding `activity_progress` record for the student with `bestScore === 100` (perfect score on at least one attempt).
+1. The student's `progress` document for the course has `percentage === 100` (all chapters and activities completed — combined progress, not chapters-only).
+2. Every activity in the course's `gamification` subcollection has a corresponding `activity_progress` record for the student with `bestScorePercent === 100` (perfect score on at least one attempt).
 
 If either condition is not met, the endpoint returns `403` with code `CERTIFICATE_NOT_ELIGIBLE`. If the course has no gamification activities, only the chapter-completion check applies.
 
+Note: since `percentage` is now a combined chapter+activity value, a student who completes all chapters but has not submitted all activities will have `percentage < 100` and will not be eligible even if their chapter completion is 100%. Both conditions must be fully satisfied.
+
 ### Issue or retrieve a certificate — `POST /v1/courses/:courseId/certificates`
 
-Idempotent. If a certificate has already been issued for this student and course, the existing certificate is returned without creating a duplicate. If eligible and no certificate exists, a new one is created.
+Idempotent. If a certificate has already been issued for this student and course, the existing certificate is returned without creating a duplicate. If eligible and no certificate exists, a new one is created. Always returns HTTP 200.
 
 ```json
 // Response (new or existing certificate)
@@ -640,7 +743,7 @@ Idempotent. If a certificate has already been issued for this student and course
 
 | HTTP Status | Code | What it means |
 |---|---|---|
-| `403` | `CERTIFICATE_NOT_ELIGIBLE` | Chapter progress is not 100%, or at least one activity does not have a 100% best score. |
+| `403` | `CERTIFICATE_NOT_ELIGIBLE` | Combined progress is not 100%, or at least one activity does not have a 100% best score percentage. |
 | `500` | `INTERNAL_ERROR` | Server error during issuance. |
 
 ### Get my certificate — `GET /v1/courses/:courseId/certificates/me`
@@ -723,6 +826,8 @@ When called by a student, enrolls the student in a course. When called by an adm
 // Admin enrolling a student
 { "courseId": "3bViFooKRQSBQxVLjGIJ", "userId": "abc123xyz" }
 ```
+
+If the student is already enrolled, the endpoint returns `409` with code `CONFLICT` — not a silent success. Check for this code and show an appropriate message rather than treating it as a generic error.
 
 ---
 
@@ -822,6 +927,8 @@ Understanding the gamification system helps you build the right UI reactions at 
 - `top_3`
 - `number_1`
 
+`active_learner` and `perfect_score` can now be earned from both quiz submissions and gamification activity submissions — they are not exclusive to activities. `perfect_score` requires a 100% score on the submission that triggers it.
+
 Action endpoints now return newly awarded badges as `earnedBadges` objects with metadata (`id`, `name`, `icon`, `color`) so clients can render UI immediately without extra lookup tables.
 
 The recommended UI pattern for gamification feedback is to read points plus `earnedBadges` from the immediate response to drive animation/modal, then call `GET /auth/me` in the background to refresh global user totals and persistent badge array.
@@ -850,10 +957,18 @@ These are subtle behaviours that are easy to miss and hard to debug once you hit
 
 **`drag_drop` and `true_or_false` strip correct answers on GET, same as quizzes.** When a student fetches an activity, `correctCategory` is removed from drag-drop items and `correct` is removed from true-or-false statements. The full shape is only visible to admins. Don't rely on the GET response to pre-populate correct answers on the frontend.
 
-**`progressPercentage` only appears for authenticated users on `GET /v1/courses`.** Unauthenticated responses omit this field entirely — do not default it to `0` if it is absent, as that may indicate the user is simply not logged in rather than having zero progress.
+**`progressPercentage` on `GET /v1/courses` is combined chapter+activity progress.** The field reflects how many total items (chapters + activities) have been completed, not just chapters. A course with 2 chapters done out of 2 chapters total but no activities done will not show `progressPercentage: 100` if the course has activities. Unauthenticated responses omit this field entirely — do not default it to `0` if it is absent, as that may indicate the user is simply not logged in.
 
-**Certificate eligibility requires a perfect score on every activity, not just completion.** A student who has `completed: true` on all activities but whose `bestScore` is less than 100 on any one of them will receive `403 CERTIFICATE_NOT_ELIGIBLE` when calling `POST /certificates`. Completion and perfect score are tracked separately. Make sure your UI distinguishes "activity completed" from "activity perfected" if you want to show certificate eligibility progress.
+**`percentage` in the progress response is combined, not chapters-only.** This changed in a recent backend update. If your UI previously displayed the progress percentage as chapter completion and treated activities separately, it may now show a lower percentage than expected for users who have not completed all activities. The progress bar should represent the full course completion, not just chapter reading.
+
+**Certificate eligibility requires a perfect `bestScorePercent` on every activity, not just completion.** A student who has `completed: true` on all activities but whose `bestScorePercent` is less than 100 on any one of them will receive `403 CERTIFICATE_NOT_ELIGIBLE` when calling `POST /certificates`. The eligibility check uses `bestScorePercent === 100` — the normalised 0–100 percentage field, not the raw `bestScore` points field. Additionally, since the `percentage` gate is now combined, the student must also have completed all activities (not just chapters) before the progress check passes.
 
 **Chapters, quizzes, and activities are not enrollment-gated.** Any authenticated student can read content from any published course — they do not need to be enrolled. The access gate on all content routes is `requirePublishedCourse` (course exists and `isPublished === true`), not enrollment. Enrollment is tracked in the database but is not currently enforced as an access gate.
 
-**Enrollment endpoints are currently unreachable.** The enrollment router exists in the backend but is not mounted. All `/v1/enrollments/*` calls will return `404`. Wait for the backend fix before implementing enrollment UI flows.
+**Enrollment endpoints are currently unreachable.** The enrollment router exists in the backend but is not mounted. All `/v1/enrollments/*` calls will return `404`. Wait for the backend fix before implementing enrollment UI flows. When the router is mounted, be aware that attempting to enroll in a course you are already enrolled in returns `409 CONFLICT`, not a silent success.
+
+**Chapter `videoUrl` has been replaced by `mediaType` + `mediaUrl`.** If your code reads `chapter.videoUrl` to render a video, it will get `undefined` on any chapter created after this change. Switch to reading `chapter.mediaType` and `chapter.mediaUrl`. Existing chapters in older databases that still have `videoUrl` can be migrated using the `migrate-videourl-to-mediaurl.mjs` script — ask the backend team if you encounter chapters with missing media.
+
+**`DELETE /v1/users/:uid` is a permanent hard delete.** Unlike many "delete" endpoints that soft-delete by setting `isActive: false`, this one removes the Firebase Auth record and all associated Firestore data immediately. There is no undo, no recycle bin, and no recovery path. Build a confirmation dialog in any admin UI that calls this endpoint.
+
+**Quiz submissions now award `active_learner` and `perfect_score` badges.** Previously only gamification activities triggered these badges. Now quiz submissions trigger the same `activity_submitted` badge check. If your UI shows a badge notification only after activity submits, update it to also handle the `earnedBadges` array on quiz submit responses.

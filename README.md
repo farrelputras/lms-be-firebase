@@ -58,7 +58,8 @@ lms-be-firebase/
 │   │   └── utils/
 │   │       ├── response.ts           # success() and error() envelope helpers
 │   │       ├── badges.ts             # checkAndAwardBadges utility + BADGE_REGISTRY
-│   │       └── courseProgress.ts     # recalculateCourseProgress — combined chapter+activity %
+│   │       ├── courseProgress.ts     # recalculateCourseProgress — combined chapter+activity %
+│   │       └── chatbotAccess.ts      # resolveChatbotEnabled — role-bypass + flag + env default
 │   ├── scripts/
 │   │   ├── seedQuiz.mjs              # Seed a test quiz into a course
 │   │   ├── test-badges.mjs           # Standalone badge logic tests
@@ -208,7 +209,7 @@ The users router exposes five endpoints, all admin-only:
 |---|---|---|
 | `GET` | `/v1/users` | List users; optional `?role=` and `?search=` query params |
 | `GET` | `/v1/users/:uid` | Fetch a single user document |
-| `PATCH` | `/v1/users/:uid` | Update `name`, `email`, and/or `totalPoints` directly |
+| `PATCH` | `/v1/users/:uid` | Update `name`, `email`, `totalPoints`, and/or `chatbotEnabled` directly |
 | `DELETE` | `/v1/users/:uid` | **Hard delete** — removes Firebase Auth record and cascades Firestore deletion for enrollments, progress, quiz_results, activity_progress, and certificates |
 | `POST` | `/v1/users/upsert` | Create the user doc if it doesn't exist, otherwise update email/name — useful as a backward-compatible sync fallback |
 
@@ -223,6 +224,8 @@ Each route file follows the same internal structure. The router is created at th
 All collections are at the Firestore root level except chapters, quizzes, and gamification activities, which are subcollections under their parent course document.
 
 **`users/{uid}`** — One document per Firebase Auth user. The `totalPoints` field is the source of truth for a user's accumulated points. It is written using `FieldValue.increment()` in gamification handlers, and can also be set directly via `PATCH /v1/users/:uid` for admin overrides. The `badges` field is an array of strings. `isActive` defaults to `true` on creation. **User deletion is a hard delete** — `DELETE /v1/users/:uid` removes the Firebase Auth record and cascades to all Firestore documents where `userId == uid` (enrollments, progress, quiz_results, activity_progress, certificates). There is no soft-delete / `isActive: false` path in the current implementation.
+
+The optional `chatbotEnabled` field gates access to the AI chatbot. It has three states: absent (admin never toggled — resolved against the `CHATBOT_DEFAULT_ACCESS` env default), `true` (explicitly granted), or `false` (explicitly revoked). It is **never written at signup** — that omission is what makes a future default flip migration-free. Every API response that includes a user profile emits an already-resolved boolean via `resolveChatbotEnabled` in `utils/chatbotAccess.ts`; `admin` and `instructor` roles always resolve to `true` regardless of the stored value.
 
 **`courses/{courseId}`** — Top-level course documents. `isPublished` controls visibility for non-admin users at the API layer. `totalChapters` and `totalActivities` are integer counter fields maintained by the chapter and activity create/delete handlers using `FieldValue.increment(±1)`.
 
@@ -317,7 +320,8 @@ After each call, callers map the returned badge IDs through `BADGE_REGISTRY` (ex
 | `CLIENT_EMAIL` | Yes (explicit init) | Service account email. |
 | `PRIVATE_KEY` | Yes (explicit init) | Service account private key. Newline-escaped — the code calls `.replace(/\\n/g, '\n')` during init. |
 | `STORAGE_BUCKET` | Yes (for storage routes) | GCS bucket name without `gs://` prefix. Used for both explicit init and ADC fallback. |
-| `CORS_ORIGIN` | No | Currently unused — the CORS configuration in `index.ts` is hardcoded to `origin: "*"`. This variable is read from env but the line is commented out. Restore the commented block before any production deployment that requires CORS restriction. |
+| `CORS_ORIGIN` | No | Currently unused — the CORS configuration in `index.ts` is hardcoded to `origin: "*"`. The env var line is commented out. Restore it before any production deployment that requires CORS restriction. |
+| `CHATBOT_DEFAULT_ACCESS` | No | Controls the fallback for students whose `chatbotEnabled` field is absent (never admin-toggled). `"false"` = denied (thesis pilot default). Flip to `"true"` and redeploy at public launch — no Firestore migration needed. `admin` and `instructor` accounts bypass this entirely. |
 
 If all four Admin SDK variables are present, the SDK initializes with explicit service account credentials. If any are missing, it falls back to ADC with `storageBucket` passed explicitly. For local development with the Firebase emulator, ADC works automatically — you do not need to provide the service account variables. For production deployment, always use explicit credentials via environment config.
 

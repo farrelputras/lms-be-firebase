@@ -204,7 +204,7 @@ Changes a user's role. Valid values for `role` are `student`, `instructor`, and 
 
 ### Get current user profile — `GET /v1/auth/me`
 
-Returns the full profile of the currently authenticated user. Call this after login to hydrate your user state, and again after any action that might change `totalPoints` or `badges`. The `totalPoints` field always returns a number (never null — defaults to `0`), and `badges` always returns an array (never null — defaults to `[]`).
+Returns the full profile of the currently authenticated user. Call this after login to hydrate your user state, and again after any action that might change `totalPoints` or `badges`. The `totalPoints` field always returns a number (never null — defaults to `0`), `badges` always returns an array (never null — defaults to `[]`), and `chatbotEnabled` always returns a boolean (never `undefined` — the backend resolves it before sending).
 
 ```json
 // Response
@@ -217,7 +217,8 @@ Returns the full profile of the currently authenticated user. Call this after lo
     "role": "student",
     "totalPoints": 42,
     "badges": ["perfect_score"],
-    "isActive": true
+    "isActive": true,
+    "chatbotEnabled": false
   }
 }
 ```
@@ -239,7 +240,7 @@ Returns all user profiles. Supports two optional query parameters:
 {
   "success": true,
   "data": [
-    { "uid": "abc123", "name": "Budi Santoso", "email": "budi@example.com", "role": "student", "totalPoints": 42, "badges": [], "isActive": true }
+    { "uid": "abc123", "name": "Budi Santoso", "email": "budi@example.com", "role": "student", "totalPoints": 42, "badges": [], "isActive": true, "chatbotEnabled": false }
   ]
 }
 ```
@@ -250,14 +251,19 @@ Returns a single user document. Returns `404` with code `NOT_FOUND` if the user 
 
 ### Update a user — `PATCH /v1/users/:uid` *(admin only)*
 
-Partial update. Accepted fields: `name`, `email`, `totalPoints`. If `email` or `name` is provided, the Firebase Auth record is also updated.
+Partial update. Accepted fields: `name`, `email`, `totalPoints`, `chatbotEnabled`. If `email` or `name` is provided, the Firebase Auth record is also updated.
 
 ```json
+// Example: grant chatbot access to a student
+{ "chatbotEnabled": true }
+
 // Example: override a student's point total
 { "totalPoints": 100 }
 ```
 
 `totalPoints` is set to the provided value directly — this is not an increment operation. Use this only for admin corrections; normal point accumulation goes through the gamification route handlers.
+
+`chatbotEnabled` must be a boolean (`true` or `false`) — sending a string like `"yes"` returns `400 BAD_REQUEST`. For `admin` and `instructor` accounts the stored value is irrelevant (they always have access), so toggling only has meaning for `student` rows. The response always echoes the resolved boolean, not the raw stored value.
 
 ### Delete a user — `DELETE /v1/users/:uid` *(admin only)*
 
@@ -970,5 +976,7 @@ These are subtle behaviours that are easy to miss and hard to debug once you hit
 **Chapter `videoUrl` has been replaced by `mediaType` + `mediaUrl`.** If your code reads `chapter.videoUrl` to render a video, it will get `undefined` on any chapter created after this change. Switch to reading `chapter.mediaType` and `chapter.mediaUrl`. Existing chapters in older databases that still have `videoUrl` can be migrated using the `migrate-videourl-to-mediaurl.mjs` script — ask the backend team if you encounter chapters with missing media.
 
 **`DELETE /v1/users/:uid` is a permanent hard delete.** Unlike many "delete" endpoints that soft-delete by setting `isActive: false`, this one removes the Firebase Auth record and all associated Firestore data immediately. There is no undo, no recycle bin, and no recovery path. Build a confirmation dialog in any admin UI that calls this endpoint.
+
+**`chatbotEnabled` is always a resolved boolean — use strict equality.** Every user profile from `/auth/me`, `GET /v1/users`, and `PATCH /v1/users/:uid` includes `chatbotEnabled` as a boolean. Gate chatbot UI with `userProfile.chatbotEnabled === true` (strict). `admin` and `instructor` always receive `true` regardless of the stored field. For students, the value reflects either an explicit admin toggle or the `CHATBOT_DEFAULT_ACCESS` env default (currently `false` for the thesis pilot). Revocation takes effect on the student's next profile refresh — not instantly.
 
 **Quiz submissions now award `active_learner` and `perfect_score` badges.** Previously only gamification activities triggered these badges. Now quiz submissions trigger the same `activity_submitted` badge check. If your UI shows a badge notification only after activity submits, update it to also handle the `earnedBadges` array on quiz submit responses.

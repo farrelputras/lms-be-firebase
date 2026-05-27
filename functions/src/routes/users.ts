@@ -6,6 +6,7 @@ import {
 } from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
+import {resolveChatbotEnabled} from "../utils/chatbotAccess.js";
 import {success, error} from "../utils/response.js";
 
 const router = Router();
@@ -32,7 +33,11 @@ router.get("/", async (req, res) => {
         const data = normalizeFirestoreData(
           docSnap.data()
         ) as Record<string, unknown>;
-        return {uid: docSnap.id, ...data};
+        return {
+          uid: docSnap.id,
+          ...data,
+          chatbotEnabled: resolveChatbotEnabled(data.role as string | undefined, data.chatbotEnabled),
+        };
       }
     );
 
@@ -62,9 +67,11 @@ router.get("/:uid", async (req, res) => {
       return;
     }
 
+    const data = normalizeFirestoreData(docSnap.data()) as Record<string, unknown>;
     res.json(success({
       uid: docSnap.id,
-      ...(normalizeFirestoreData(docSnap.data()) as Record<string, unknown>),
+      ...data,
+      chatbotEnabled: resolveChatbotEnabled(data.role as string | undefined, data.chatbotEnabled),
     }));
   } catch {
     res.status(500).json(error("FETCH_FAILED", "Failed to fetch user"));
@@ -75,7 +82,12 @@ router.get("/:uid", async (req, res) => {
 router.patch("/:uid", async (req, res) => {
   try {
     const {uid} = req.params;
-    const {name, email, totalPoints} = req.body as {name?: string; email?: string; totalPoints?: number};
+    const {name, email, totalPoints, chatbotEnabled} = req.body as {
+      name?: string;
+      email?: string;
+      totalPoints?: number;
+      chatbotEnabled?: boolean;
+    };
 
     const updates: Record<string, unknown> = {
       updatedAt: FieldValue.serverTimestamp(),
@@ -83,6 +95,13 @@ router.patch("/:uid", async (req, res) => {
     if (name !== undefined) updates.name = name;
     if (email !== undefined) updates.email = email;
     if (totalPoints !== undefined) updates.totalPoints = totalPoints;
+    if (chatbotEnabled !== undefined) {
+      if (typeof chatbotEnabled !== "boolean") {
+        res.status(400).json(error("BAD_REQUEST", "chatbotEnabled must be a boolean"));
+        return;
+      }
+      updates.chatbotEnabled = chatbotEnabled;
+    }
 
     await adminDb.collection("users").doc(uid).update(updates);
 
@@ -90,9 +109,11 @@ router.patch("/:uid", async (req, res) => {
     if (name) await adminAuth.updateUser(uid, {displayName: name});
 
     const updated = await adminDb.collection("users").doc(uid).get();
+    const updatedData = normalizeFirestoreData(updated.data()) as Record<string, unknown>;
     res.json(success({
       uid: updated.id,
-      ...(normalizeFirestoreData(updated.data()) as Record<string, unknown>),
+      ...updatedData,
+      chatbotEnabled: resolveChatbotEnabled(updatedData.role as string | undefined, updatedData.chatbotEnabled),
     }));
   } catch {
     res.status(500).json(

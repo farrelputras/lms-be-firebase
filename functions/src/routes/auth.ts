@@ -5,6 +5,7 @@ import {adminAuth, adminDb, normalizeFirestoreData} from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
 import {checkAndAwardBadges, BADGE_REGISTRY} from "../utils/badges.js";
+import {resolveChatbotEnabled} from "../utils/chatbotAccess.js";
 import {success, error} from "../utils/response.js";
 
 const router = Router();
@@ -128,6 +129,7 @@ router.get("/me", verifyToken, async (req, res) => {
         0 :
         profile.totalPoints,
       badges: profile.badges === undefined ? [] : profile.badges,
+      chatbotEnabled: resolveChatbotEnabled(profile.role as string | undefined, profile.chatbotEnabled),
     }));
   } catch (err: any) {
   // JSON.stringify ensures the error isn't hidden in the cloud logs

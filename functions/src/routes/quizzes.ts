@@ -126,9 +126,22 @@ router.post(
   async (req, res) => {
     try {
       const courseId = req.params.courseId as string;
-      const {title, questions} = req.body as {
+      const {
+        title,
+        questions,
+        type,
+        gamificationType,
+        passingGrade,
+        allowRetake,
+        showAnswers,
+      } = req.body as {
         title?: string;
         questions?: QuizQuestion[];
+        type?: string;
+        gamificationType?: string;
+        passingGrade?: number;
+        allowRetake?: boolean;
+        showAnswers?: boolean;
       };
 
       if (!title || !questions || !Array.isArray(questions)) {
@@ -138,12 +151,21 @@ router.post(
         return;
       }
 
-      const quizData = {
+      const quizData: Record<string, unknown> = {
         title,
         questions,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       };
+
+      // Persist optional quiz metadata when provided
+      if (type !== undefined) quizData.type = type;
+      if (gamificationType !== undefined) {
+        quizData.gamificationType = gamificationType;
+      }
+      if (passingGrade !== undefined) quizData.passingGrade = passingGrade;
+      if (allowRetake !== undefined) quizData.allowRetake = allowRetake;
+      if (showAnswers !== undefined) quizData.showAnswers = showAnswers;
 
       const docRef = await adminDb
         .collection("courses")
@@ -176,9 +198,22 @@ router.patch(
     try {
       const courseId = req.params.courseId as string;
       const quizId = req.params.quizId as string;
-      const {title, questions} = req.body as {
+      const {
+        title,
+        questions,
+        type,
+        gamificationType,
+        passingGrade,
+        allowRetake,
+        showAnswers,
+      } = req.body as {
         title?: string;
         questions?: QuizQuestion[];
+        type?: string;
+        gamificationType?: string;
+        passingGrade?: number;
+        allowRetake?: boolean;
+        showAnswers?: boolean;
       };
 
       const updates: Record<string, unknown> = {
@@ -186,6 +221,13 @@ router.patch(
       };
       if (title !== undefined) updates.title = title;
       if (questions !== undefined) updates.questions = questions;
+      if (type !== undefined) updates.type = type;
+      if (gamificationType !== undefined) {
+        updates.gamificationType = gamificationType;
+      }
+      if (passingGrade !== undefined) updates.passingGrade = passingGrade;
+      if (allowRetake !== undefined) updates.allowRetake = allowRetake;
+      if (showAnswers !== undefined) updates.showAnswers = showAnswers;
 
       await adminDb
         .collection("courses")

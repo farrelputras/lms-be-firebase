@@ -9,14 +9,19 @@ import {checkAndAwardBadges, BADGE_REGISTRY} from "../utils/badges.js";
 import {success, error} from "../utils/response.js";
 
 interface QuizQuestion {
-  question: string;
-  options: string[];
-  correctAnswerIndex: number;
+  questionText: string;
+  type?: string;
+  options?: string[];
+  correctAnswerIndex?: number;
+  correctAnswerText?: string;
+  points?: number;
 }
 
 interface StudentQuizQuestion {
-  question: string;
-  options: string[];
+  questionText: string;
+  type?: string;
+  options?: string[];
+  points?: number;
 }
 
 const toStudentQuestions = (questions: unknown): StudentQuizQuestion[] => {
@@ -24,12 +29,15 @@ const toStudentQuestions = (questions: unknown): StudentQuizQuestion[] => {
     return [];
   }
 
-  return questions.map((q) => ({
-    question: ((q as Record<string, unknown>).questionText as string) || "",
-    options: Array.isArray((q as Record<string, unknown>).options) ?
-      ((q as Record<string, unknown>).options as string[]) :
-      [],
-  }));
+  return questions.map((q) => {
+    const qRecord = q as Record<string, unknown>;
+    return {
+      questionText: (qRecord.questionText as string) || "",
+      type: (qRecord.type as string) || "multipleChoice",
+      options: Array.isArray(qRecord.options) ? (qRecord.options as string[]) : [],
+      points: (qRecord.points as number) || 1,
+    };
+  });
 };
 
 const router = Router({mergeParams: true});
@@ -307,7 +315,7 @@ router.post(
     try {
       const courseId = req.params.courseId as string;
       const quizId = req.params.quizId as string;
-      const {answers} = req.body as {answers?: number[]};
+      const {answers} = req.body as {answers?: (number | string)[]};
 
       if (!answers || !Array.isArray(answers)) {
         res.status(400).json(
@@ -342,15 +350,35 @@ router.post(
       }
 
       let correctCount = 0;
+      let pointsAwarded = 0;
       questions.forEach((q, i) => {
-        if (q.correctAnswerIndex === answers[i]) correctCount++;
+        const answer = answers[i];
+        let isCorrect = false;
+
+        if (q.type === "shortAnswer") {
+          if (
+            answer != null &&
+            String(answer).trim().toLowerCase() === (q.correctAnswerText || "").trim().toLowerCase()
+          ) {
+            isCorrect = true;
+          }
+        } else {
+          if (q.correctAnswerIndex === answer) {
+            isCorrect = true;
+          }
+        }
+
+        if (isCorrect) {
+          correctCount++;
+          pointsAwarded += (q.points || 1);
+        }
       });
 
       const totalQuestions = questions.length;
       const uid = req.user!.uid;
 
       await adminDb.collection("users").doc(uid).set({
-        totalPoints: FieldValue.increment(correctCount),
+        totalPoints: FieldValue.increment(pointsAwarded),
       }, {merge: true});
 
       // 1. Submit basic quiz activity check
@@ -372,11 +400,20 @@ router.post(
         ...BADGE_REGISTRY[id as keyof typeof BADGE_REGISTRY]
       }));
 
-      const answerSummary = questions.map((q, i) => ({
-        questionId: ((q as unknown as Record<string, unknown>).id as string) ||
-          String(i),
-        correct: q.correctAnswerIndex === answers[i],
-      }));
+      const answerSummary = questions.map((q, i) => {
+        const answer = answers[i];
+        let isCorrect = false;
+        if (q.type === "shortAnswer") {
+          isCorrect = answer != null && String(answer).trim().toLowerCase() === (q.correctAnswerText || "").trim().toLowerCase();
+        } else {
+          isCorrect = q.correctAnswerIndex === answer;
+        }
+
+        return {
+          questionId: ((q as unknown as Record<string, unknown>).id as string) || String(i),
+          correct: isCorrect,
+        };
+      });
 
       const resultData = {
         userId: uid,
@@ -386,7 +423,7 @@ router.post(
         score: Math.round((correctCount / totalQuestions) * 100),
         correctCount,
         totalQuestions,
-        pointsAwarded: correctCount,
+        pointsAwarded,
         submittedAt: FieldValue.serverTimestamp(),
       };
 
@@ -398,7 +435,7 @@ router.post(
         score: correctCount,
         total: totalQuestions,
         passed: correctCount === totalQuestions,
-        pointsAwarded: correctCount,
+        pointsAwarded,
         earnedBadges, // Updated to pass the full badge objects
         answers: answerSummary,
       }));

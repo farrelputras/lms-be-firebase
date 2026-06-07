@@ -126,6 +126,101 @@ router.get(
   }
 );
 
+// GET /courses/:courseId/quizzes/:quizId/result — student: aggregated prior result
+router.get(
+  "/:quizId/result",
+  verifyToken,
+  requirePublishedCourse,
+  async (req, res) => {
+    try {
+      const courseId = req.params.courseId as string;
+      const quizId = req.params.quizId as string;
+      const uid = req.user!.uid;
+
+      // 1. Load quiz doc — 404 if missing (mirrors GET /:quizId)
+      const quizSnap = await adminDb
+        .collection("courses")
+        .doc(courseId)
+        .collection("quizzes")
+        .doc(quizId)
+        .get();
+
+      if (!quizSnap.exists) {
+        res.status(404).json(error("NOT_FOUND", "Quiz not found"));
+        return;
+      }
+
+      const quizData = quizSnap.data();
+      const passingGrade =
+        typeof quizData?.passingGrade === "number" ? quizData.passingGrade : 0;
+      const questions = Array.isArray(quizData?.questions) ? quizData.questions : [];
+      const totalQuestions = (questions as unknown[]).length;
+
+      // 2. Equality-only query — no composite index needed (merge-join on single-field indexes)
+      const resultsSnap = await adminDb
+        .collection("quiz_results")
+        .where("userId", "==", uid)
+        .where("quizId", "==", quizId)
+        .get();
+
+      // 3. Aggregate in memory; guard legacy/malformed rows (pre-refactor mobile writes may
+      //    lack quizId; treat missing score/pointsAwarded as 0)
+      let attemptCount = 0;
+      let bestScore = 0;          // stored as percentage (0–100)
+      let bestPointsAwarded = 0;  // raw points
+      let lastSubmittedAt: string | null = null;
+
+      for (const docSnap of resultsSnap.docs) {
+        const d = docSnap.data();
+        // Skip rows without a quizId field
+        if (!d.quizId) continue;
+
+        attemptCount++;
+        const rowScore = typeof d.score === "number" ? d.score : 0;
+        const rowPoints = typeof d.pointsAwarded === "number" ? d.pointsAwarded : 0;
+        if (rowScore > bestScore) bestScore = rowScore;
+        if (rowPoints > bestPointsAwarded) bestPointsAwarded = rowPoints;
+
+        const submittedAt = d.submittedAt?.toDate?.();
+        if (submittedAt instanceof Date) {
+          const iso = submittedAt.toISOString();
+          if (lastSubmittedAt === null || iso > lastSubmittedAt) {
+            lastSubmittedAt = iso;
+          }
+        }
+      }
+
+      const attempted = attemptCount > 0;
+      // passed: server-authoritative; units are points vs points (matches §14.3 rule)
+      const passed =
+        attempted && (passingGrade > 0 ? bestPointsAwarded >= passingGrade : true);
+
+      res.json(
+        success({
+          attempted,
+          attemptCount,
+          bestScore,
+          bestPointsAwarded,
+          totalQuestions,
+          passingGrade,
+          passed,
+          lastSubmittedAt,
+        })
+      );
+    } catch (err: unknown) {
+      console.error({
+        route: "GET /courses/:courseId/quizzes/:quizId/result",
+        uid: req.user?.uid,
+        courseId: req.params.courseId,
+        quizId: req.params.quizId,
+        errorMessage: err instanceof Error ? err.message : String(err),
+        error: err,
+      });
+      res.status(500).json(error("FETCH_FAILED", "Failed to fetch quiz result"));
+    }
+  }
+);
+
 // POST /courses/:courseId/quizzes — admin only
 router.post(
   "/",

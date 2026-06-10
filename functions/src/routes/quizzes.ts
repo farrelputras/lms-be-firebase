@@ -191,9 +191,15 @@ router.get(
       }
 
       const attempted = attemptCount > 0;
-      // passed: server-authoritative; units are points vs points (matches §14.3 rule)
+      // passed: server-authoritative; units are points vs points (matches §14.3 rule).
+      // A perfect score (bestScore is a percentage) always passes — guards against
+      // quizzes authored with passingGrade above max obtainable points, and keeps
+      // this flag consistent with the web result screen. Additive: only ever makes
+      // `passed` more lenient.
       const passed =
-        attempted && (passingGrade > 0 ? bestPointsAwarded >= passingGrade : true);
+        attempted &&
+        (bestScore === 100 ||
+          (passingGrade > 0 ? bestPointsAwarded >= passingGrade : true));
 
       res.json(
         success({

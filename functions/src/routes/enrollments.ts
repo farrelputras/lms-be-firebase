@@ -1,9 +1,9 @@
 import {Router} from "express";
-import {FieldValue} from "firebase-admin/firestore";
 
 import {adminDb, normalizeFirestoreData} from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {success, error} from "../utils/response.js";
+import {createEnrollmentIfAbsent} from "../utils/enrollment.js";
 
 const router = Router();
 
@@ -17,17 +17,14 @@ router.post("/", async (req, res) => {
       userId?: string;
     };
     const callerUid = req.user!.uid;
+    const callerRole = req.user!.role;
 
-    if (userId && req.user!.role !== "admin") {
+    if (userId && callerRole !== "admin") {
       res.status(403).json(
         error("FORBIDDEN", "Only admin can enroll another user")
       );
       return;
     }
-
-    const targetUserId = userId && req.user!.role === "admin" ?
-      userId :
-      callerUid;
 
     if (!courseId) {
       res.status(400).json(
@@ -36,38 +33,63 @@ router.post("/", async (req, res) => {
       return;
     }
 
-    // Verify course exists
-    const courseSnap = await adminDb
-      .collection("courses").doc(courseId).get();
+    const isAdminEnrollingOther = Boolean(userId) && callerRole === "admin";
+    const targetUserId = isAdminEnrollingOther ? userId! : callerUid;
+
+    // Admin enrolling another user — full bypass (any course/tier/publish state)
+    if (isAdminEnrollingOther) {
+      const courseSnap = await adminDb.collection("courses").doc(courseId).get();
+      if (!courseSnap.exists) {
+        res.status(404).json(error("NOT_FOUND", "Course not found"));
+        return;
+      }
+
+      const result = await createEnrollmentIfAbsent(targetUserId, courseId);
+      if (!result.created) {
+        res.status(409).json(
+          error("CONFLICT", "Already enrolled in this course")
+        );
+        return;
+      }
+      res.status(201).json(success({id: result.id, userId: targetUserId, courseId}));
+      return;
+    }
+
+    // Self-enroll: must be published, free course
+    const courseSnap = await adminDb.collection("courses").doc(courseId).get();
     if (!courseSnap.exists) {
       res.status(404).json(error("NOT_FOUND", "Course not found"));
       return;
     }
 
-    // Check duplicate enrollment
-    const existing = await adminDb
-      .collection("enrollments")
-      .where("userId", "==", targetUserId)
-      .where("courseId", "==", courseId)
-      .limit(1)
-      .get();
+    const courseData = courseSnap.data() as {
+      isPublished?: boolean;
+      accessTier?: string;
+    };
 
-    if (!existing.empty) {
+    if (courseData.isPublished !== true) {
+      res.status(404).json(error("NOT_FOUND", "Course not found"));
+      return;
+    }
+
+    if (courseData.accessTier === "premium") {
+      res.status(403).json(
+        error(
+          "PREMIUM_REQUIRES_REQUEST",
+          "This is a premium course. Submit an enrollment request to gain access."
+        )
+      );
+      return;
+    }
+
+    const result = await createEnrollmentIfAbsent(targetUserId, courseId);
+    if (!result.created) {
       res.status(409).json(
         error("CONFLICT", "Already enrolled in this course")
       );
       return;
     }
-
-    const enrollmentData = {
-      userId: targetUserId,
-      courseId,
-      enrolledAt: FieldValue.serverTimestamp(),
-    };
-
-    const docRef = await adminDb
-      .collection("enrollments").add(enrollmentData);
-    res.status(201).json(success({id: docRef.id, ...enrollmentData}));
+    res.status(201).json(success({id: result.id, userId: targetUserId, courseId}));
   } catch (err: unknown) {
     console.error({
       route: "POST /enrollments",

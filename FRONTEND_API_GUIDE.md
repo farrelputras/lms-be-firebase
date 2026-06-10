@@ -24,7 +24,8 @@ This guide is written for frontend developers (web or mobile) consuming the LMS 
 - [Progress Endpoints](#progress-endpoints) — mark complete, get progress, reset (dev only)
 - [Certificate Endpoints](#certificate-endpoints)
 - [User Certificate Endpoint](#user-certificate-endpoint) — all certs across courses
-- [Enrollment Endpoints](#enrollment-endpoints) ⚠️ currently unmounted — see section
+- [Enrollment Endpoints](#enrollment-endpoints)
+- [Enrollment Request Endpoints](#enrollment-request-endpoints) — premium request lifecycle, admin queue, approve/decline
 - [Leaderboard Endpoint](#leaderboard-endpoint)
 - [Storage Endpoints](#storage-endpoints)
 - [Media Endpoints](#media-endpoints)
@@ -127,8 +128,11 @@ The following error codes appear across multiple endpoints. Each endpoint sectio
 | `401` | `UNAUTHORIZED` | Token is missing, expired, or invalid. Refresh the token and retry. |
 | `403` | `FORBIDDEN` | The user is authenticated but does not have permission. Show an access denied message. |
 | `403` | `LOCKED` | The activity is locked because the previous item has not been completed. Show a "complete previous item" prompt — this is distinct from a permission error. |
+| `403` | `PREMIUM_NOT_ENROLLED` | The course is premium and the user is not enrolled. Render the premium gate screen (see [Premium Enrollment Gate](#premium-enrollment-gate)). |
+| `403` | `PREMIUM_REQUIRES_REQUEST` | Self-enroll was attempted on a premium course. The user must submit an enrollment request instead. |
 | `404` | `NOT_FOUND` | The resource does not exist, or is hidden for access control reasons (e.g. unpublished course). |
 | `409` | `CONFLICT` | A duplicate resource already exists (e.g. enrolling in a course you are already enrolled in). |
+| `409` | `ALREADY_ENROLLED` | An enrollment request was submitted but the student is already enrolled. |
 | `500` | `*_FAILED` | Something went wrong on the server. Log the error and show a generic retry message. |
 
 One important nuance on `404`: when a non-admin requests an unpublished course, the API returns `404` rather than `403`. This is intentional — it prevents the frontend from leaking information about the existence of unpublished content. Treat all `404` responses the same way regardless of why they were returned.
@@ -306,9 +310,21 @@ No token required. Non-admin users receive a `404` if the course is unpublished 
 
 New courses are created with `isPublished: false` by default. Use `PATCH` to publish when ready.
 
+The optional `accessTier` field controls the enrollment model:
+
+| `accessTier` value | Behavior |
+|---|---|
+| `"free"` | Students can self-enroll freely into published courses. Content reads are never gated by enrollment. |
+| `"premium"` | Students must submit an enrollment request and receive admin approval. All content/chapter/quiz/activity reads for non-enrolled students return `403 PREMIUM_NOT_ENROLLED`. |
+| *(absent)* | Treated as `"free"`. Existing courses without this field are unaffected. |
+
+If `accessTier` is sent with any value other than `"free"` or `"premium"`, the request returns `400 BAD_REQUEST`.
+
 ### Update a course — `PATCH /v1/courses/:courseId` *(admin only)*
 
-Partial update — only include the fields you want to change. To publish a course, send `{ "isPublished": true }`. To unpublish, send `{ "isPublished": false }`. Other fields are left untouched.
+Partial update — only include the fields you want to change. To publish a course, send `{ "isPublished": true }`. To unpublish, send `{ "isPublished": false }`. To make a course premium, send `{ "accessTier": "premium" }`. To revert to free, send `{ "accessTier": "free" }`. Other fields are left untouched.
+
+> ⚠️ **Operational note:** Flipping an already-popular course to `"premium"` retroactively gates all students who don't have an enrollment doc. Since almost no student has an enrollment doc today (the enrollment flow was previously unreachable), this will lock current readers out until each is manually approved. Introduce `"premium"` on new courses or courses with no active readers during the pilot.
 
 ### Delete a course — `DELETE /v1/courses/:courseId` *(admin only)*
 
@@ -319,6 +335,8 @@ Partial update — only include the fields you want to change. To publish a cour
 ## Chapter Endpoints
 
 All chapter routes are nested under `/v1/courses/:courseId/chapters`. Every student request to these routes requires the user to be **authenticated and the course to be published**. Unauthenticated requests receive `401`; requests to an unpublished or non-existent course receive `404`.
+
+**Premium courses:** If the course has `accessTier: "premium"` and the student is not enrolled, all chapter reads return `403 PREMIUM_NOT_ENROLLED`. Admins always bypass this gate. Free / absent-tier courses are unaffected.
 
 ### List chapters — `GET /v1/courses/:courseId/chapters`
 
@@ -352,6 +370,8 @@ Deletes the chapter and decrements the `totalChapters` counter on the course doc
 ## Quiz Endpoints
 
 All quiz routes are nested under `/v1/courses/:courseId/quizzes`. Student requests require authentication and the course to be published.
+
+**Premium courses:** If the course has `accessTier: "premium"` and the student is not enrolled, all quiz reads and submit return `403 PREMIUM_NOT_ENROLLED`. Admins bypass. Free / absent-tier courses are unaffected.
 
 ### Question types
 
@@ -549,6 +569,8 @@ After receiving a submit response, call `GET /auth/me` to refresh the user's ful
 
 All activity routes are nested under `/v1/courses/:courseId/activities`. Student requests require authentication and the course to be published. Activities are stored in the `gamification` subcollection under a course document.
 
+**Premium courses:** If the course has `accessTier: "premium"` and the student is not enrolled, all activity reads and submit return `403 PREMIUM_NOT_ENROLLED`. Admins bypass. Free / absent-tier courses are unaffected.
+
 There are three activity types: `drag_drop`, `word_search`, and `true_or_false`. The type is fixed at creation and cannot be changed via update.
 
 ### Create an activity — `POST /v1/courses/:courseId/activities` *(admin only)*
@@ -705,6 +727,8 @@ Deletes the activity and **cascades**: all `activity_progress` documents for tha
 ### Get course content — `GET /v1/courses/:courseId/content`
 
 Returns a unified, ordered list of all chapters and activities for a course. Requires authentication and the course to be published. This is the primary endpoint for rendering the course sidebar or table of contents — it replaces calling `GET /chapters` and `GET /activities` separately.
+
+**Premium courses:** If the course has `accessTier: "premium"` and the student is not enrolled, this endpoint returns `403 PREMIUM_NOT_ENROLLED`. Use `GET /v1/courses/:courseId` (course metadata — never gated) to render the premium gate screen with course title/description. Admins always receive the full content list.
 
 Each item in the array includes `itemType` (`"chapter"` or `"activity"`), `completed`, and `locked` fields in addition to the item's own data. Items are sorted by `position` ascending. Activities with sensitive fields (`correctCategory`, `correct`) are already stripped in this response.
 
@@ -916,11 +940,11 @@ Returns an empty array if the user has no certificates yet. Use this to populate
 
 ## Enrollment Endpoints
 
-> ⚠️ **Known issue:** The enrollment router is currently not mounted in the backend entry point. All `/v1/enrollments/*` endpoints will return `404` until this is fixed. Do not build enrollment flows against the current production build — check with the backend team before using these routes.
+All enrollment routes require authentication (`verifyToken`).
 
 ### Check enrollment status — `GET /v1/enrollments/:courseId/status`
 
-Returns `{ "enrolled": true/false }`. Use this to decide whether to show a "Start Course" or "Enroll" button without fetching the full enrollment list.
+Returns `{ "enrolled": true/false }`. Use this to decide whether to show a "Start Course" or "Request Access" button without fetching the full enrollment list.
 
 ### Get my enrollments — `GET /v1/enrollments/my`
 
@@ -928,17 +952,176 @@ Returns all courses the current user is enrolled in. Use this to populate the st
 
 ### Enroll a user — `POST /v1/enrollments`
 
-When called by a student, enrolls the student in a course. When called by an admin, the `userId` field can be used to enroll any other user. Non-admin users who provide `userId` receive a `403`.
+When called by a student, enrolls the student in a **published, free** course. When called by an admin (with `userId` in the body), enrolls any user in any course regardless of tier or publish state.
 
 ```json
-// Student enrolling themselves
+// Student enrolling themselves (published, free course only)
 { "courseId": "3bViFooKRQSBQxVLjGIJ" }
 
-// Admin enrolling a student
+// Admin enrolling a student (any course, any tier)
 { "courseId": "3bViFooKRQSBQxVLjGIJ", "userId": "abc123xyz" }
 ```
 
-If the student is already enrolled, the endpoint returns `409` with code `CONFLICT` — not a silent success. Check for this code and show an appropriate message rather than treating it as a generic error.
+| HTTP Status | Code | What it means |
+|---|---|---|
+| `201` | — | Enrollment created successfully. |
+| `403` | `PREMIUM_REQUIRES_REQUEST` | The course is premium. Students must use `POST /enrollment-requests` instead. |
+| `403` | `FORBIDDEN` | A non-admin sent `userId` in the body. |
+| `404` | `NOT_FOUND` | The course does not exist or is unpublished. |
+| `409` | `CONFLICT` | The student is already enrolled. |
+
+---
+
+## Enrollment Request Endpoints
+
+### Premium Enrollment Gate
+
+When a student opens a premium course they are not enrolled in, all content endpoints (`/content`, `/chapters`, `/quizzes`, `/activities`) return `403 PREMIUM_NOT_ENROLLED`. The course metadata endpoint (`GET /v1/courses/:courseId`) is **never gated** — use it to fetch the course title and description to render the gate screen.
+
+The recommended flow:
+1. Catch `403 PREMIUM_NOT_ENROLLED` in your course layout/shell.
+2. Call `GET /v1/courses/:courseId` to get course metadata for display.
+3. Call `GET /v1/enrollment-requests/me` to find the request status for this course.
+4. Render the gate screen with a CTA based on status (see table below).
+
+| Student state | CTA |
+|---|---|
+| No request exists | "Minta Akses" → `POST /enrollment-requests` |
+| Request is `pending` | "Menunggu persetujuan" (disabled) |
+| Request is `declined` | Show `declineReason` (if any) + "Minta Akses lagi" → `POST /enrollment-requests` again |
+| Request is `approved` / enrolled | Enter the course (gate passes) |
+
+All enrollment request routes require authentication (`verifyToken`). Admin routes additionally require `requireRole('admin')`.
+
+### EnrollmentRequest object shape
+
+```json
+{
+  "id": "uid_courseId",
+  "userId": "abc123xyz",
+  "courseId": "3bViFooKRQSBQxVLjGIJ",
+  "status": "pending",
+  "requestedAt": "2026-06-11T08:00:00.000Z",
+  "decidedAt": null,
+  "decidedBy": null,
+  "declineReason": null
+}
+```
+
+`status` is `"pending"`, `"approved"`, or `"declined"`. `decidedAt`, `decidedBy`, and `declineReason` are absent until a decision is made.
+
+The document ID is `{uid}_{courseId}` — one request doc per student per course. This is the idempotency key: re-requesting after a decline **overwrites** the same doc back to `pending`, so there is never a queue of multiple requests for the same pair.
+
+### Submit a premium enrollment request — `POST /v1/enrollment-requests`
+
+```json
+// Request body
+{ "courseId": "3bViFooKRQSBQxVLjGIJ" }
+```
+
+```json
+// Response (HTTP 201 on new request; HTTP 200 if a pending request already exists)
+{
+  "success": true,
+  "data": {
+    "id": "abc123xyz_3bViFooKRQSBQxVLjGIJ",
+    "userId": "abc123xyz",
+    "courseId": "3bViFooKRQSBQxVLjGIJ",
+    "status": "pending",
+    "requestedAt": "2026-06-11T08:00:00.000Z"
+  }
+}
+```
+
+- If a `pending` request already exists → returns the existing doc with `HTTP 200` (idempotent).
+- If a `declined` request exists → overwrites it back to `pending` (re-request allowed, `HTTP 201`).
+- If the student is already enrolled → `409 ALREADY_ENROLLED`.
+- The course must be published and have `accessTier: "premium"` → otherwise `404` or `400 BAD_REQUEST`.
+
+### Get my enrollment requests — `GET /v1/enrollment-requests/me`
+
+Returns all of the calling student's own enrollment request docs across all courses. Use this to show pending/declined status on course cards or the gate screen.
+
+```json
+// Response
+{
+  "success": true,
+  "data": [
+    {
+      "id": "abc123xyz_3bViFooKRQSBQxVLjGIJ",
+      "userId": "abc123xyz",
+      "courseId": "3bViFooKRQSBQxVLjGIJ",
+      "status": "declined",
+      "requestedAt": "2026-06-10T10:00:00.000Z",
+      "decidedAt": "2026-06-10T11:00:00.000Z",
+      "decidedBy": "adminUid",
+      "declineReason": "Enrollment is temporarily closed."
+    }
+  ]
+}
+```
+
+Returns an empty array if the student has no requests. Results are sorted by `requestedAt` descending.
+
+### Get pending request queue — `GET /v1/enrollment-requests` *(admin only)*
+
+Returns all requests matching the given status across all courses. Default: `?status=pending`.
+
+```
+GET /v1/enrollment-requests?status=pending
+GET /v1/enrollment-requests?status=approved
+GET /v1/enrollment-requests?status=declined
+```
+
+Results are ordered by `requestedAt` descending (most recent first). Use this to render the admin approval queue.
+
+### Approve a request — `POST /v1/enrollment-requests/:id/approve` *(admin only)*
+
+`:id` is the composite `{uid}_{courseId}` document ID. Approving creates an enrollment doc (idempotent — approving twice creates only one enrollment) and marks the request `approved`.
+
+```json
+// Response
+{
+  "success": true,
+  "data": {
+    "id": "abc123xyz_3bViFooKRQSBQxVLjGIJ",
+    "status": "approved",
+    "decidedAt": "2026-06-11T09:00:00.000Z",
+    "decidedBy": "adminUid",
+    ...
+  }
+}
+```
+
+After approval, the student's next content read will pass the premium gate.
+
+### Decline a request — `POST /v1/enrollment-requests/:id/decline` *(admin only)*
+
+Body `{ "reason": "..." }` is optional. The `reason` string is shown to the student on the gate screen.
+
+```json
+// Request body (optional)
+{ "reason": "Enrollment is paused until next semester." }
+```
+
+```json
+// Response
+{
+  "success": true,
+  "data": {
+    "id": "abc123xyz_3bViFooKRQSBQxVLjGIJ",
+    "status": "declined",
+    "decidedAt": "2026-06-11T09:00:00.000Z",
+    "decidedBy": "adminUid",
+    "declineReason": "Enrollment is paused until next semester.",
+    ...
+  }
+}
+```
+
+A declined student may re-request at any time (no cooldown).
+
+> **Mobile coordination note (for Ikmal):** The premium enrollment gate is **inert on all free / absent-tier courses** — mobile behavior for free courses is completely unchanged. For premium courses, content/chapter/quiz/activity reads now return `403 PREMIUM_NOT_ENROLLED` when the student is not enrolled. Mobile must handle this 403 gracefully without crashing (a "request access" screen or a toast is sufficient for the pilot). The gate only activates when an admin explicitly labels a course `accessTier: "premium"`.
 
 ---
 
@@ -1106,9 +1289,11 @@ These are subtle behaviours that are easy to miss and hard to debug once you hit
 
 **Certificate eligibility requires a perfect `bestScorePercent` on every activity, not just completion.** A student who has `completed: true` on all activities but whose `bestScorePercent` is less than 100 on any one of them will receive `403 CERTIFICATE_NOT_ELIGIBLE` when calling `POST /certificates`. The eligibility check uses `bestScorePercent === 100` — the normalised 0–100 percentage field, not the raw `bestScore` points field. Additionally, since the `percentage` gate is now combined, the student must also have completed all activities (not just chapters) before the progress check passes.
 
-**Chapters, quizzes, and activities are not enrollment-gated.** Any authenticated student can read content from any published course — they do not need to be enrolled. The access gate on all content routes is `requirePublishedCourse` (course exists and `isPublished === true`), not enrollment. Enrollment is tracked in the database but is not currently enforced as an access gate.
+**Free-course content reads are never enrollment-gated.** For courses with `accessTier: "free"` or absent `accessTier` (the vast majority), any authenticated student can read content from any published course without being enrolled. The gate only activates on courses explicitly labeled `accessTier: "premium"`. This means the existing "open playground" behavior is fully preserved for free courses — no migration or backfill needed.
 
-**Enrollment endpoints are currently unreachable.** The enrollment router exists in the backend but is not mounted. All `/v1/enrollments/*` calls will return `404`. Wait for the backend fix before implementing enrollment UI flows. When the router is mounted, be aware that attempting to enroll in a course you are already enrolled in returns `409 CONFLICT`, not a silent success.
+**Premium-course content returns `403 PREMIUM_NOT_ENROLLED`, not `404`.** If a student opens a premium course they are not enrolled in, all content/chapter/quiz/activity endpoints return `403 PREMIUM_NOT_ENROLLED`. The course metadata (`GET /v1/courses/:courseId`) is intentionally *not* gated — you can always fetch title and description for the gate screen. Handle this 403 in your course layout/shell, not on individual page components, so that bookmarked deep links (`/course/x/chapter/y`) also hit the gate.
+
+**`POST /v1/enrollments` now rejects premium courses and unpublished courses.** Previously, self-enroll into an unpublished course was possible. Now: unpublished or missing → `404`; premium → `403 PREMIUM_REQUIRES_REQUEST`. The admin-enroll-another-user path (sending `userId` as admin) is unchanged — it bypasses all tier/publish checks.
 
 **Chapter `videoUrl` has been replaced by `mediaType` + `mediaUrl`.** If your code reads `chapter.videoUrl` to render a video, it will get `undefined` on any chapter created after this change. Switch to reading `chapter.mediaType` and `chapter.mediaUrl`. Existing chapters in older databases that still have `videoUrl` can be migrated using the `migrate-videourl-to-mediaurl.mjs` script — ask the backend team if you encounter chapters with missing media.
 

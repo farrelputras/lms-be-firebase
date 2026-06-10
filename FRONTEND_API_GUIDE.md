@@ -353,18 +353,31 @@ Deletes the chapter and decrements the `totalChapters` counter on the course doc
 
 All quiz routes are nested under `/v1/courses/:courseId/quizzes`. Student requests require authentication and the course to be published.
 
+### Question types
+
+The backend supports two question types:
+
+| `type` | Answer field | Scoring rule |
+|---|---|---|
+| `multipleChoice` *(default)* | `correctAnswerIndex` (integer) | Student’s answer (integer) must equal the stored index |
+| `shortAnswer` | `correctAnswerText` (string) | Student’s answer (string) is compared case-insensitively with trimmed whitespace |
+
+Each question can also carry a `points` field (number, defaults to `1`). Points are weighted — a question with `points: 2` awards 2 points when answered correctly.
+
 ### What students see vs what admins see
 
-This is the most important thing to understand about quiz endpoints. The question shape returned to students is different from the shape stored in Firestore and returned to admins. When a student calls any GET quiz endpoint, each question is normalized to only `{ question, options[] }` — the correct answer index and other metadata are stripped. The `question` field is sourced from the stored `questionText` field. Admins receive the full stored shape including `correctAnswerIndex`.
+The question shape returned to students is different from the shape stored in Firestore and returned to admins. When a student calls any GET quiz endpoint, each question is normalized to `{ questionText, type, options[], points }` — the correct answer fields (`correctAnswerIndex`, `correctAnswerText`) are stripped. **Note:** the student-facing response uses `questionText` (not renamed to `question`) — use `questionText` on the frontend for display. Admins receive the full stored shape.
 
 ```json
 // What a student sees (normalized)
 {
-  "question": "Apa kepanjangan dari ZISWAF?",
-  "options": ["Zakat, Infak, Sedekah, Wakaf", "Zakat, Iman, Syariah, Wakaf", "..."]
+  "questionText": "Apa kepanjangan dari ZISWAF?",
+  "type": "multipleChoice",
+  "options": ["Zakat, Infak, Sedekah, Wakaf", "Zakat, Iman, Syariah, Wakaf", "..."],
+  "points": 1
 }
 
-// What an admin sees (full shape)
+// What an admin sees (full shape — multipleChoice)
 {
   "questionText": "Apa kepanjangan dari ZISWAF?",
   "correctAnswerIndex": 0,
@@ -372,31 +385,123 @@ This is the most important thing to understand about quiz endpoints. The questio
   "type": "multipleChoice",
   "points": 1
 }
+
+// What an admin sees (full shape — shortAnswer)
+{
+  "questionText": "Sebutkan salah satu rukun Islam.",
+  "correctAnswerText": "Zakat",
+  "type": "shortAnswer",
+  "points": 1
+}
 ```
 
 ### Create a quiz — `POST /v1/courses/:courseId/quizzes` *(admin only)*
 
-When writing question objects, use `questionText` as the field name for the question text — not `question`. The student normalization reads from `questionText`. If you accidentally use `question`, students will see blank question text. This is the single most important naming rule in the entire API.
+Required fields: `title` (string) and `questions` (array). When writing question objects, use `questionText` as the field name for the question text — not `question`. The student normalization reads from `questionText`. If you accidentally use `question`, students will see blank question text.
+
+The following optional quiz-level metadata fields are persisted when provided:
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | string | Quiz category label (e.g. `"pre-test"`, `"post-test"`, `"practice"`) |
+| `gamificationType` | string | Gamification category label |
+| `passingGrade` | number | Minimum raw points to pass (used by `GET /result` for `passed` flag) |
+| `allowRetake` | boolean | Whether students can retake the quiz |
+| `showAnswers` | boolean | Whether to show correct answers/explanations after submission |
+| `timeLimitMinutes` | number | Time limit in minutes for the quiz attempt |
+
+```json
+// Request body
+{
+  "title": "Pre-Test: Pengantar Ekonomi Syariah",
+  "type": "pre-test",
+  "passingGrade": 8,
+  "allowRetake": false,
+  "showAnswers": true,
+  "timeLimitMinutes": 30,
+  "questions": [
+    {
+      "questionText": "Apa kepanjangan dari ZISWAF?",
+      "type": "multipleChoice",
+      "correctAnswerIndex": 0,
+      "options": ["Zakat, Infak, Sedekah, Wakaf", "Zakat, Iman, Syariah, Wakaf"],
+      "points": 1
+    },
+    {
+      "questionText": "Sebutkan salah satu rukun Islam.",
+      "type": "shortAnswer",
+      "correctAnswerText": "Zakat",
+      "points": 1
+    }
+  ]
+}
+```
 
 ### Update a quiz — `PATCH /v1/courses/:courseId/quizzes/:quizId` *(admin only)*
 
-Partial update. Send only the fields you want to change (`title`, `questions`, or both).
+Partial update. Send only the fields you want to change. All quiz-level metadata fields (`title`, `questions`, `type`, `gamificationType`, `passingGrade`, `allowRetake`, `showAnswers`, `timeLimitMinutes`) are accepted.
 
 ### Delete a quiz — `DELETE /v1/courses/:courseId/quizzes/:quizId` *(admin only)*
 
 Deletes the quiz document. Does not cascade to `quiz_results`.
 
+### Get prior quiz result — `GET /v1/courses/:courseId/quizzes/:quizId/result`
+
+Returns the student’s aggregated prior result for a quiz. This endpoint queries all `quiz_results` documents for the current user and quiz, then computes the best score, attempt count, and pass status. Use this to determine whether a student has already attempted a quiz and whether they passed, before showing the quiz-taking UI.
+
+```json
+// Response — student has attempted the quiz
+{
+  "success": true,
+  "data": {
+    "attempted": true,
+    "attemptCount": 2,
+    "bestScore": 80,
+    "bestPointsAwarded": 8,
+    "totalQuestions": 10,
+    "passingGrade": 6,
+    "passed": true,
+    "lastSubmittedAt": "2026-06-05T10:30:00.000Z"
+  }
+}
+
+// Response — student has never attempted
+{
+  "success": true,
+  "data": {
+    "attempted": false,
+    "attemptCount": 0,
+    "bestScore": 0,
+    "bestPointsAwarded": 0,
+    "totalQuestions": 10,
+    "passingGrade": 6,
+    "passed": false,
+    "lastSubmittedAt": null
+  }
+}
+```
+
+**Field semantics:**
+- `bestScore` — percentage (0–100), the highest `score` recorded across all attempts
+- `bestPointsAwarded` — the highest raw `pointsAwarded` across all attempts
+- `totalQuestions` — current question count from the quiz document
+- `passingGrade` — minimum raw points to pass (from quiz document, defaults to `0`)
+- `passed` — `true` if `bestScore === 100` **or** `bestPointsAwarded >= passingGrade` (when `passingGrade > 0`). A perfect score always passes regardless of `passingGrade`.
+- `lastSubmittedAt` — ISO timestamp of the most recent submission, or `null` if never attempted
+
+Use this to enforce `allowRetake`: if `attempted` is `true` and the quiz has `allowRetake: false`, prevent the student from opening the quiz-taking screen.
+
 ### Submit quiz answers — `POST /v1/courses/:courseId/quizzes/:quizId/submit`
 
 This is the most complex endpoint in the API. It scores answers server-side, awards points, checks badge eligibility, and returns the full result in one response.
 
-**How to format your answers:** The `answers` field is a plain array of integers. Each integer is the zero-based index of the option the student selected. The position in the array corresponds to the question at the same position — `answers[0]` is the answer to `questions[0]`, `answers[1]` to `questions[1]`, and so on. The array length must exactly match the number of questions in the quiz.
+**How to format your answers:** The `answers` field is an array where each element corresponds positionally to a question. For `multipleChoice` questions, the element is an **integer** (the zero-based index of the selected option). For `shortAnswer` questions, the element is a **string** (the student’s text answer). The array length must exactly match the number of questions in the quiz.
 
 ```json
-// Request body — submitting answers for a 3-question quiz
-// Student selected option 0 for Q1, option 1 for Q2, option 2 for Q3
+// Request body — mixed question types
+// Q1: multipleChoice (selected option 0), Q2: shortAnswer (typed "Zakat")
 {
-  "answers": [0, 1, 2]
+  "answers": [0, "Zakat"]
 }
 ```
 
@@ -405,17 +510,11 @@ This is the most complex endpoint in the API. It scores answers server-side, awa
 {
   "success": true,
   "data": {
-    "score": 3,
-    "total": 3,
+    "score": 2,
+    "total": 2,
     "passed": true,
-    "pointsAwarded": 3,
+    "pointsAwarded": 2,
     "earnedBadges": [
-      {
-        "id": "active_learner",
-        "name": "Active Learner",
-        "icon": "auto_stories",
-        "color": "orange"
-      },
       {
         "id": "perfect_score",
         "name": "Perfect Score",
@@ -425,16 +524,22 @@ This is the most complex endpoint in the API. It scores answers server-side, awa
     ],
     "answers": [
       { "questionId": "0", "correct": true },
-      { "questionId": "1", "correct": true },
-      { "questionId": "2", "correct": true }
+      { "questionId": "1", "correct": true }
     ]
   }
 }
 ```
 
-The `passed` field is `true` **only when the student answered every question correctly** (100%). It is `false` for any partial score, including 19 out of 20. Use this field to drive the perfect score UI state. The `pointsAwarded` field always equals `score` — one point per correct answer. Points are awarded on every submission including retakes, so a student who retakes a quiz earns points each time.
+**Response field semantics:**
+- `score` — the **raw correct count** (number of questions answered correctly), not a percentage
+- `total` — total number of questions
+- `passed` — `true` **only when every question is correct** (100%). Use this for the perfect-score UI state.
+- `pointsAwarded` — sum of `points` values for each correctly answered question (weighted). Points are awarded on every submission including retakes.
+- `questionId` in the `answers` array is the question’s `id` field if present, otherwise its positional index as a string
 
-Quiz submissions now trigger the same badge checks as activity submissions. `earnedBadges` will always include `active_learner` on the first time that badge is earned, and will include `perfect_score` if the student answered every question correctly. It may also include `top_3` or `number_1` if the student's new point total places them in the leaderboard top 3.
+**Important:** the stored `quiz_results.score` is a **percentage** (`Math.round(correctCount / totalQuestions * 100)`), but the submit response’s `score` is the raw correct count. The percentage representation is used by the `GET /result` endpoint’s `bestScore` field.
+
+Quiz submissions trigger the same badge checks as activity submissions. `earnedBadges` may include `active_learner`, `perfect_score`, `top_3`, or `number_1`.
 
 After receiving a submit response, call `GET /auth/me` to refresh the user's full profile state so that `totalPoints` and `badges` are up to date in your UI.
 
@@ -870,23 +975,49 @@ Returns a signed read URL valid for 1 hour. The `:fileId` is the file path in Cl
 
 ## Media Endpoints
 
-### Upload a thumbnail image — `POST /v1/media/upload` *(admin only)*
+### Upload an image — `POST /v1/media/upload` *(admin only)*
 
-Uploads an image file directly to Cloud Storage via a multipart form upload. The backend streams the file using busboy and stores it at `thumbnails/{uuid}.{ext}`. The response contains a **permanent public URL** — it does not expire.
+Uploads an image file directly to Cloud Storage via a multipart form upload. The backend streams the file using `busboy` (not `multer` — multer conflicts with Firebase Functions v2 body buffering) and stores it at `{folder}/{uuid}.{ext}`. The response contains a **permanent public URL** — it does not expire.
 
 Send the request as `multipart/form-data` with the image in any field name. Do not set `Content-Type: application/json`.
+
+**Target folder:** You can optionally include a `folder` form field to control the storage destination. Allowed values are:
+
+| `folder` value | Use case |
+|---|---|
+| `thumbnails` *(default)* | Course thumbnail images |
+| `thumbnails/quizzes` | Quiz-related images (e.g. question images) |
+
+If `folder` is omitted or any value outside the allowlist, it defaults to `thumbnails`.
+
+```
+// Example: uploading a quiz image (multipart/form-data)
+POST /v1/media/upload
+Content-Type: multipart/form-data
+
+--boundary
+Content-Disposition: form-data; name="folder"
+
+thumbnails/quizzes
+--boundary
+Content-Disposition: form-data; name="image"; filename="question1.jpg"
+Content-Type: image/jpeg
+
+<binary data>
+--boundary--
+```
 
 ```json
 // Response (HTTP 201)
 {
   "success": true,
   "data": {
-    "imageUrl": "https://firebasestorage.googleapis.com/v0/b/your-bucket/o/thumbnails%2Fuuid.jpg?alt=media"
+    "imageUrl": "https://firebasestorage.googleapis.com/v0/b/your-bucket/o/thumbnails%2Fquizzes%2Fuuid.jpg?alt=media"
   }
 }
 ```
 
-Use the returned `imageUrl` as the `thumbnailUrl` when creating or updating a course. **Choose between the two upload patterns based on where the file lives:**
+Use the returned `imageUrl` as the `thumbnailUrl` when creating or updating a course, or as image URLs inside quiz questions. **Choose between the two upload patterns based on where the file lives:**
 - Use `POST /v1/media/upload` when the image file is already in the client and you want the server to handle the stream.
 - Use `POST /v1/storage/upload-url` when you want the client to upload directly to GCS (a signed write URL is returned; the binary never passes through the backend).
 
@@ -895,7 +1026,7 @@ Use the returned `imageUrl` as the `thumbnailUrl` when creating or updating a co
 Returns a redirect to a signed read URL by default. This lets clients render media using a backend URL while keeping storage provider details hidden behind backend contracts.
 
 Query params:
-- `path` (required): storage file path (currently restricted to `thumbnails/...`)
+- `path` (required): storage file path (currently restricted to paths starting with `thumbnails/`, which includes `thumbnails/quizzes/`)
 - `redirect` (optional): set to `0` to receive JSON instead of HTTP redirect
 
 Default behavior (`redirect` omitted or not `0`):
@@ -907,7 +1038,7 @@ JSON behavior (`redirect=0`):
   "success": true,
   "data": {
     "viewUrl": "https://...signed...",
-    "filePath": "thumbnails/example.jpg"
+    "filePath": "thumbnails/quizzes/example.jpg"
   }
 }
 ```
@@ -922,7 +1053,7 @@ Understanding the gamification system helps you build the right UI reactions at 
 
 **Points** come from three sources:
 - **Chapter completion** — `+10 points` on the first completion only. `pointsAwarded` is `0` on re-completions.
-- **Quiz submission** — `+1 point per correct answer` on every submission including retakes.
+- **Quiz submission** — points per correct answer based on each question's `points` field (defaults to `1`). Weighted scoring means a question with `points: 2` awards 2 points. Points are awarded on every submission including retakes.
 - **Activity submission** — proportional points based on score vs `maxPoints`. Only the *improvement* over the student's previous best is credited to `totalPoints`. The response field `pointsEarned` is this delta; `earnedPoints` is the raw points scored this attempt.
 
 **Badges** are strings stored in `users.badges` and awarded idempotently. Current badge IDs are:
@@ -945,11 +1076,17 @@ The recommended UI pattern for gamification feedback is to read points plus `ear
 
 These are subtle behaviours that are easy to miss and hard to debug once you hit them.
 
-**`questionText` not `question` when creating quizzes.** When your admin UI creates a quiz, the question text field must be sent as `questionText`. The student-facing GET response renames it to `question` during normalization, which can make it look like `question` is the right field name when you read the response — but it is not the right field name when you write. Writing `question` silently stores it, and students will then see blank questions.
+**`questionText` not `question` — both reading and writing.** When your admin UI creates a quiz, the question text field must be sent as `questionText`. The student-facing GET response also returns `questionText` (it is **not** renamed to `question`). Writing `question` silently stores it, and students will then see blank questions. Use `questionText` everywhere.
 
-**Quiz answers are positional integers, not objects.** The submit endpoint expects `{ "answers": [0, 2, 1] }` — not `[{ "questionId": 0, "answer": 0 }]`. The position in the array is the question identifier, and the value is the selected option index.
+**Quiz answers are positional, but not always integers.** The submit endpoint expects `{ "answers": [0, "Zakat", 2] }` — not `[{ "questionId": 0, "answer": 0 }]`. The position in the array is the question identifier. For `multipleChoice` questions, the value is the selected option index (integer). For `shortAnswer` questions, the value is the typed text (string). The array length must match the question count exactly.
 
-**`passed` means 100%, not "above passing grade".** The `passed` field in the quiz submit response is `true` only when every single question is correct. A quiz with a `passingGrade` of 8 out of 20 questions does not set `passed: true` at 8 correct — that field is exclusively for the perfect score state. You will need to implement your own passing grade logic on the frontend using `score` and `passingGrade` from the quiz document.
+**`passed` in submit means 100%, not "above passing grade".** The `passed` field in the quiz submit response is `true` only when every single question is correct. Use the `GET /result` endpoint's `passed` field for a more nuanced check that accounts for `passingGrade`. The submit response's `passed` is exclusively for the perfect-score UI state.
+
+**`GET /result`'s `passed` is smarter than submit's `passed`.** The `GET /result` endpoint considers `passingGrade`: it returns `passed: true` when `bestScore === 100` **or** when `bestPointsAwarded >= passingGrade` (if `passingGrade > 0`). Use this for persistent UI state ("you passed this quiz"). Use submit's `passed` only for the immediate perfect-score celebration.
+
+**Quiz `score` is stored as a percentage but returned as a raw count.** The submit response returns `score` as the raw number of correct answers (e.g. `3` out of `5`). But `quiz_results.score` in Firestore is stored as a percentage (`60`). The `GET /result` endpoint's `bestScore` field is this percentage. Don't confuse the two representations.
+
+**Quiz metadata fields control frontend behavior, not backend enforcement.** `allowRetake`, `showAnswers`, and `timeLimitMinutes` are stored and returned by the API but **not enforced server-side**. The backend will happily accept a second submission even if `allowRetake: false`. The frontend is responsible for reading these fields from the quiz document and enforcing them in the UI (e.g. hiding the retake button, hiding answer explanations, starting a countdown timer).
 
 **`GET /auth/me` after gamification actions.** Submit/progress responses include immediate points fields (`pointsAwarded` or `pointsEarned`) and `earnedBadges`, but they do not return updated cumulative `totalPoints`. Call `GET /auth/me` after these actions to refresh totals shown in header/profile.
 

@@ -243,6 +243,7 @@ router.post(
         passingGrade,
         allowRetake,
         showAnswers,
+        timeLimitMinutes,
       } = req.body as {
         title?: string;
         questions?: QuizQuestion[];
@@ -251,6 +252,7 @@ router.post(
         passingGrade?: number;
         allowRetake?: boolean;
         showAnswers?: boolean;
+        timeLimitMinutes?: number;
       };
 
       if (!title || !questions || !Array.isArray(questions)) {
@@ -275,6 +277,7 @@ router.post(
       if (passingGrade !== undefined) quizData.passingGrade = passingGrade;
       if (allowRetake !== undefined) quizData.allowRetake = allowRetake;
       if (showAnswers !== undefined) quizData.showAnswers = showAnswers;
+      if (timeLimitMinutes !== undefined) quizData.timeLimitMinutes = timeLimitMinutes;
 
       const docRef = await adminDb
         .collection("courses")
@@ -315,6 +318,7 @@ router.patch(
         passingGrade,
         allowRetake,
         showAnswers,
+        timeLimitMinutes,
       } = req.body as {
         title?: string;
         questions?: QuizQuestion[];
@@ -323,6 +327,7 @@ router.patch(
         passingGrade?: number;
         allowRetake?: boolean;
         showAnswers?: boolean;
+        timeLimitMinutes?: number;
       };
 
       const updates: Record<string, unknown> = {
@@ -337,6 +342,7 @@ router.patch(
       if (passingGrade !== undefined) updates.passingGrade = passingGrade;
       if (allowRetake !== undefined) updates.allowRetake = allowRetake;
       if (showAnswers !== undefined) updates.showAnswers = showAnswers;
+      if (timeLimitMinutes !== undefined) updates.timeLimitMinutes = timeLimitMinutes;
 
       await adminDb
         .collection("courses")

@@ -73,6 +73,16 @@ router.post(
       let fileBuffer: Buffer | null = null;
       let fileName = "";
       let fileMime = "";
+      let targetFolder = "thumbnails";
+
+      bb.on("field", (fieldname: string, val: string) => {
+        if (fieldname === "folder") {
+          const allowedFolders = ["thumbnails", "thumbnails/quizzes"];
+          if (allowedFolders.includes(val)) {
+            targetFolder = val;
+          }
+        }
+      });
 
       bb.on(
         "file",
@@ -100,7 +110,7 @@ router.post(
 
           const bucket = adminStorage.bucket();
           const ext = fileName.split(".").pop() ?? "jpg";
-          const filename = `thumbnails/${uuidv4()}.${ext}`;
+          const filename = `${targetFolder}/${uuidv4()}.${ext}`;
           const fileRef = bucket.file(filename);
 
           await fileRef.save(fileBuffer, {
@@ -127,8 +137,6 @@ router.post(
 } else {
   req.pipe(bb);
 }
-
-      req.pipe(bb);
     } catch (err: unknown) {
       console.error("Upload Error:", err);
       res.status(500).json(error("UPLOAD_FAILED", String(err)));

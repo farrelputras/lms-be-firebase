@@ -17,6 +17,8 @@ import leaderboardRouter from "./routes/leaderboard.js";
 import mediaRouter from "./routes/media.js";
 import certificatesRouter from "./routes/certificates.js";
 import certificatesUserRouter from "./routes/certificatesUser.js";
+import enrollmentsRouter from "./routes/enrollments.js";
+import enrollmentRequestsRouter from "./routes/enrollmentRequests.js";
 
 setGlobalOptions({maxInstances: 10});
 
@@ -51,6 +53,8 @@ app.use("/v1/courses/:courseId/content", contentRouter);
 app.use("/v1/courses/:courseId/progress", progressRouter);
 app.use("/v1/courses/:courseId/certificates", certificatesRouter);
 app.use("/v1/certificates", certificatesUserRouter);
+app.use("/v1/enrollments", enrollmentsRouter);
+app.use("/v1/enrollment-requests", enrollmentRequestsRouter);
 app.use("/v1/storage", storageRouter);
 app.use("/v1/leaderboard", leaderboardRouter);
 app.use("/v1/media", mediaRouter);

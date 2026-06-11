@@ -95,11 +95,12 @@ router.post(
   requireRole("admin"),
   async (req, res) => {
     try {
-      const {title, description, thumbnailUrl, isPublished} = req.body as {
+      const {title, description, thumbnailUrl, isPublished, accessTier} = req.body as {
         title?: string;
         description?: string;
         thumbnailUrl?: string;
         isPublished?: boolean;
+        accessTier?: string;
       };
 
       if (!title) {
@@ -109,7 +110,14 @@ router.post(
         return;
       }
 
-      const courseData = {
+      if (accessTier !== undefined && accessTier !== "free" && accessTier !== "premium") {
+        res.status(400).json(
+          error("BAD_REQUEST", "accessTier must be \"free\" or \"premium\"")
+        );
+        return;
+      }
+
+      const courseData: Record<string, unknown> = {
         title,
         description: description || "",
         thumbnailUrl: thumbnailUrl || "",
@@ -117,9 +125,13 @@ router.post(
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       };
+      if (accessTier !== undefined) courseData.accessTier = accessTier;
 
       const docRef = await adminDb.collection("courses").add(courseData);
-      res.status(201).json(success({id: docRef.id, ...courseData}));
+      res.status(201).json(success({
+        id: docRef.id,
+        ...(courseData as Record<string, unknown>),
+      }));
     } catch {
       res.status(500).json(
         error("CREATE_FAILED", "Failed to create course")
@@ -136,12 +148,20 @@ router.patch(
   async (req, res) => {
     try {
       const courseId = req.params.courseId as string;
-      const {title, description, thumbnailUrl, isPublished} = req.body as {
+      const {title, description, thumbnailUrl, isPublished, accessTier} = req.body as {
         title?: string;
         description?: string;
         thumbnailUrl?: string;
         isPublished?: boolean;
+        accessTier?: string;
       };
+
+      if (accessTier !== undefined && accessTier !== "free" && accessTier !== "premium") {
+        res.status(400).json(
+          error("BAD_REQUEST", "accessTier must be \"free\" or \"premium\"")
+        );
+        return;
+      }
 
       const updates: Record<string, unknown> = {
         updatedAt: FieldValue.serverTimestamp(),
@@ -152,6 +172,7 @@ router.patch(
         updates.thumbnailUrl = thumbnailUrl;
       }
       if (isPublished !== undefined) updates.isPublished = isPublished;
+      if (accessTier !== undefined) updates.accessTier = accessTier;
 
       await adminDb.collection("courses").doc(courseId).update(updates);
       const updated = await adminDb

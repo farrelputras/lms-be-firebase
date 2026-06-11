@@ -5,6 +5,7 @@ import {adminDb, normalizeFirestoreData} from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
 import {requirePublishedCourse} from "../middleware/requirePublishedCourse.js";
+import {requirePremiumEnrollment} from "../middleware/requirePremiumEnrollment.js";
 import {checkAndAwardBadges, BADGE_REGISTRY} from "../utils/badges.js";
 import {success, error} from "../utils/response.js";
 
@@ -43,7 +44,7 @@ const toStudentQuestions = (questions: unknown): StudentQuizQuestion[] => {
 const router = Router({mergeParams: true});
 
 // GET /courses/:courseId/quizzes — list quizzes (auth + enrolled)
-router.get("/", verifyToken, requirePublishedCourse, async (req, res) => {
+router.get("/", verifyToken, requirePublishedCourse, requirePremiumEnrollment, async (req, res) => {
   try {
     const courseId = req.params.courseId as string;
     const snapshot = await adminDb
@@ -84,6 +85,7 @@ router.get(
   "/:quizId",
   verifyToken,
   requirePublishedCourse,
+  requirePremiumEnrollment,
   async (req, res) => {
     try {
       const courseId = req.params.courseId as string;
@@ -131,6 +133,7 @@ router.get(
   "/:quizId/result",
   verifyToken,
   requirePublishedCourse,
+  requirePremiumEnrollment,
   async (req, res) => {
     try {
       const courseId = req.params.courseId as string;
@@ -418,6 +421,7 @@ router.post(
   "/:quizId/submit",
   verifyToken,
   requirePublishedCourse,
+  requirePremiumEnrollment,
   async (req, res) => {
     try {
       const courseId = req.params.courseId as string;

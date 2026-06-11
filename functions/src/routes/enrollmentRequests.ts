@@ -287,4 +287,96 @@ router.post("/:id/decline", requireRole("admin"), async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /enrollment-requests/:id/revoke — admin revokes an approved enrollment
+// ---------------------------------------------------------------------------
+router.post("/:id/revoke", requireRole("admin"), async (req, res) => {
+  try {
+    const id = req.params.id as string;
+    const adminUid = req.user!.uid;
+    const {reason} = req.body as {reason?: string};
+
+    const docRef = adminDb.collection("enrollment_requests").doc(id);
+    const docSnap = await docRef.get();
+
+    if (!docSnap.exists) {
+      res.status(404).json(error("NOT_FOUND", "Enrollment request not found"));
+      return;
+    }
+
+    const requestData = docSnap.data() as {
+      userId?: string;
+      courseId?: string;
+      status?: string;
+    };
+
+    const {userId, courseId, status} = requestData;
+
+    if (!userId || !courseId) {
+      res.status(500).json(
+        error("ENROLLMENT_GATE_FAILED", "Request document is missing userId or courseId")
+      );
+      return;
+    }
+
+    // Only approved enrollments can be revoked (pending/declined have nothing to revoke;
+    // revoked→revoked re-calls return 409 so no duplicate audit rows are written)
+    if (status !== "approved") {
+      res.status(409).json(
+        error("NOT_REVOCABLE", "Only an approved enrollment can be revoked")
+      );
+      return;
+    }
+
+    // Find ALL enrollment docs for this (userId, courseId) pair.
+    // Enrollment docs use auto-IDs (not composite IDs), so a race can produce more than one.
+    const enrollmentSnap = await adminDb
+      .collection("enrollments")
+      .where("userId", "==", userId)
+      .where("courseId", "==", courseId)
+      .get();
+
+    // Prepare the audit doc ref before the batch so we have an auto-ID
+    const auditRef = adminDb.collection("enrollment_audit").doc();
+
+    const auditData: Record<string, unknown> = {
+      action: "revoke",
+      userId,
+      courseId,
+      actorUid: adminUid,
+      revokedAt: FieldValue.serverTimestamp(),
+    };
+    if (reason !== undefined && reason !== "") {
+      auditData.reason = reason;
+    }
+
+    // Atomic batch: delete all enrollment docs + stamp the request + write audit row
+    const batch = adminDb.batch();
+    enrollmentSnap.docs.forEach((d) => batch.delete(d.ref));
+    batch.update(docRef, {
+      status: "revoked",
+      decidedAt: FieldValue.serverTimestamp(),
+      decidedBy: adminUid,
+    });
+    batch.set(auditRef, auditData);
+    await batch.commit();
+
+    const updated = await docRef.get();
+    res.json(success({
+      id,
+      ...(normalizeFirestoreData(updated.data()) as Record<string, unknown>),
+    }));
+  } catch (err: unknown) {
+    console.error({
+      route: "POST /enrollment-requests/:id/revoke",
+      uid: req.user?.uid,
+      requestId: req.params.id,
+      errorMessage: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json(
+      error("REVOKE_FAILED", "Failed to revoke enrollment request")
+    );
+  }
+});
+
 export default router;

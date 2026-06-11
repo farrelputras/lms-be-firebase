@@ -22,6 +22,7 @@ interface StudentQuizQuestion {
   type?: string;
   options?: string[];
   points?: number;
+  imageUrl?: string;
 }
 
 const toStudentQuestions = (questions: unknown): StudentQuizQuestion[] => {
@@ -36,6 +37,7 @@ const toStudentQuestions = (questions: unknown): StudentQuizQuestion[] => {
       type: (qRecord.type as string) || "multipleChoice",
       options: Array.isArray(qRecord.options) ? (qRecord.options as string[]) : [],
       points: (qRecord.points as number) || 1,
+      imageUrl: typeof qRecord.imageUrl === "string" ? qRecord.imageUrl : undefined,
     };
   });
 };

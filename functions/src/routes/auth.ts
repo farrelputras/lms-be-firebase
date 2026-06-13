@@ -141,6 +141,50 @@ router.get("/me", verifyToken, async (req, res) => {
 }
 });
 
+// PATCH /auth/me — self-service name confirmation (PRD19)
+router.patch("/me", verifyToken, async (req, res) => {
+  const uid = req.user!.uid;
+  try {
+    const name = ((req.body.name as string | undefined) ?? "").trim();
+    if (name.length < 2 || name.length > 40) {
+      res.status(400).json(
+        error("BAD_REQUEST", "Nama harus 2–40 karakter")
+      );
+      return;
+    }
+
+    const userRef = adminDb.collection("users").doc(uid);
+    await userRef.set(
+      {name, displayNameConfirmed: true, updatedAt: FieldValue.serverTimestamp()},
+      {merge: true}
+    );
+
+    await adminAuth.updateUser(uid, {displayName: name});
+
+    const docSnap = await userRef.get();
+    const profile = normalizeFirestoreData(
+      docSnap.data()
+    ) as Record<string, unknown>;
+
+    res.json(success({
+      uid: docSnap.id,
+      ...profile,
+      totalPoints: profile.totalPoints === undefined ? 0 : profile.totalPoints,
+      badges: profile.badges === undefined ? [] : profile.badges,
+      chatbotEnabled: resolveChatbotEnabled(
+        profile.role as string | undefined,
+        profile.chatbotEnabled
+      ),
+    }));
+  } catch (err: unknown) {
+    console.error("🔴 PATCH_ME_ERROR:", JSON.stringify({
+      uid,
+      message: err instanceof Error ? err.message : String(err),
+    }));
+    res.status(500).json(error("UPDATE_FAILED", "Failed to update display name"));
+  }
+});
+
 // POST /auth/sync — Bridges Client-Side Auth with Server-Side Firestore
 router.post("/sync", verifyToken, async (req, res) => {
   try {

@@ -25,7 +25,7 @@ This guide is written for frontend developers (web or mobile) consuming the LMS 
 - [Certificate Endpoints](#certificate-endpoints)
 - [User Certificate Endpoint](#user-certificate-endpoint) — all certs across courses
 - [Enrollment Endpoints](#enrollment-endpoints)
-- [Enrollment Request Endpoints](#enrollment-request-endpoints) — premium request lifecycle, admin queue, approve/decline
+- [Enrollment Request Endpoints](#enrollment-request-endpoints) — premium request lifecycle, admin queue, approve/decline/revoke
 - [Leaderboard Endpoint](#leaderboard-endpoint)
 - [Storage Endpoints](#storage-endpoints)
 - [Media Endpoints](#media-endpoints)
@@ -133,6 +133,7 @@ The following error codes appear across multiple endpoints. Each endpoint sectio
 | `404` | `NOT_FOUND` | The resource does not exist, or is hidden for access control reasons (e.g. unpublished course). |
 | `409` | `CONFLICT` | A duplicate resource already exists (e.g. enrolling in a course you are already enrolled in). |
 | `409` | `ALREADY_ENROLLED` | An enrollment request was submitted but the student is already enrolled. |
+| `409` | `NOT_REVOCABLE` | An admin tried to revoke an enrollment request that is not in `approved` state (only approved enrollments can be revoked). |
 | `500` | `*_FAILED` | Something went wrong on the server. Log the error and show a generic retry message. |
 
 One important nuance on `404`: when a non-admin requests an unpublished course, the API returns `404` rather than `403`. This is intentional — it prevents the frontend from leaking information about the existence of unpublished content. Treat all `404` responses the same way regardless of why they were returned.
@@ -386,15 +387,16 @@ Each question can also carry a `points` field (number, defaults to `1`). Points 
 
 ### What students see vs what admins see
 
-The question shape returned to students is different from the shape stored in Firestore and returned to admins. When a student calls any GET quiz endpoint, each question is normalized to `{ questionText, type, options[], points }` — the correct answer fields (`correctAnswerIndex`, `correctAnswerText`) are stripped. **Note:** the student-facing response uses `questionText` (not renamed to `question`) — use `questionText` on the frontend for display. Admins receive the full stored shape.
+The question shape returned to students is different from the shape stored in Firestore and returned to admins. When a student calls any GET quiz endpoint, each question is normalized to `{ questionText, type, options[], points, imageUrl? }` — the correct answer fields (`correctAnswerIndex`, `correctAnswerText`) are stripped. **Note:** the student-facing response uses `questionText` (not renamed to `question`) — use `questionText` on the frontend for display. The optional `imageUrl` (a storage path) is passed through when present — render it via `GET /v1/media/view?path=<imageUrl>`. Admins receive the full stored shape.
 
 ```json
 // What a student sees (normalized)
 {
-  "questionText": "Apa kepanjangan dari ZISWAF?",
+  "questionText": "Perhatikan gambar berikut. Akad apa yang ditunjukkan?",
   "type": "multipleChoice",
-  "options": ["Zakat, Infak, Sedekah, Wakaf", "Zakat, Iman, Syariah, Wakaf", "..."],
-  "points": 1
+  "options": ["Mudharabah", "Murabahah", "Ijarah"],
+  "points": 1,
+  "imageUrl": "thumbnails/quizzes/uuid.jpg"
 }
 
 // What an admin sees (full shape — multipleChoice)
@@ -418,6 +420,8 @@ The question shape returned to students is different from the shape stored in Fi
 ### Create a quiz — `POST /v1/courses/:courseId/quizzes` *(admin only)*
 
 Required fields: `title` (string) and `questions` (array). When writing question objects, use `questionText` as the field name for the question text — not `question`. The student normalization reads from `questionText`. If you accidentally use `question`, students will see blank question text.
+
+Each question object may also carry an optional **`imageUrl`** (a storage path). Upload the image first via `POST /v1/media/upload` with `folder=thumbnails/quizzes`, then store the returned path on the question. The `questions` array is persisted verbatim, so `imageUrl` round-trips through create/update with no extra API field and is passed through to students by the read projection.
 
 The following optional quiz-level metadata fields are persisted when provided:
 
@@ -989,6 +993,7 @@ The recommended flow:
 | No request exists | "Minta Akses" → `POST /enrollment-requests` |
 | Request is `pending` | "Menunggu persetujuan" (disabled) |
 | Request is `declined` | Show `declineReason` (if any) + "Minta Akses lagi" → `POST /enrollment-requests` again |
+| Request is `revoked` | "Akses kamu dicabut" + "Minta Akses lagi" → `POST /enrollment-requests` again (revoke reason is **not** surfaced to the student — it lives in the audit log) |
 | Request is `approved` / enrolled | Enter the course (gate passes) |
 
 All enrollment request routes require authentication (`verifyToken`). Admin routes additionally require `requireRole('admin')`.
@@ -1008,7 +1013,7 @@ All enrollment request routes require authentication (`verifyToken`). Admin rout
 }
 ```
 
-`status` is `"pending"`, `"approved"`, or `"declined"`. `decidedAt`, `decidedBy`, and `declineReason` are absent until a decision is made.
+`status` is `"pending"`, `"approved"`, `"declined"`, or `"revoked"`. `decidedAt`, `decidedBy`, and `declineReason` are absent until a decision is made. A `revoked` status means an admin removed a previously-approved enrollment (see the **Revoke an enrollment** endpoint below); the student may re-request.
 
 The document ID is `{uid}_{courseId}` — one request doc per student per course. This is the idempotency key: re-requesting after a decline **overwrites** the same doc back to `pending`, so there is never a queue of multiple requests for the same pair.
 
@@ -1120,6 +1125,43 @@ Body `{ "reason": "..." }` is optional. The `reason` string is shown to the stud
 ```
 
 A declined student may re-request at any time (no cooldown).
+
+### Revoke an enrollment — `POST /v1/enrollment-requests/:id/revoke` *(admin only)*
+
+`:id` is the composite `{uid}_{courseId}` document ID. Revoke removes a student's premium access **after** it was approved. In one atomic operation it: deletes **all** `enrollments` docs for the pair (so the gate closes — the student's next content read returns `403 PREMIUM_NOT_ENROLLED`), sets the request `status` to `revoked`, and writes an `enrollment_audit` record (admin-only, never client-read).
+
+Only an `approved` request can be revoked — revoking a `pending`, `declined`, or already-`revoked` request returns `409 NOT_REVOCABLE`.
+
+Body `{ "reason": "..." }` is optional and is stored **only in the audit log** — it is **not** shown to the student (unlike a decline reason).
+
+```json
+// Request body (optional)
+{ "reason": "Approved by mistake." }
+```
+
+```json
+// Response
+{
+  "success": true,
+  "data": {
+    "id": "abc123xyz_3bViFooKRQSBQxVLjGIJ",
+    "status": "revoked",
+    "decidedAt": "2026-06-12T09:00:00.000Z",
+    "decidedBy": "adminUid",
+    ...
+  }
+}
+```
+
+**What survives revoke:** the student's learning records and credential are untouched — `progress`, `quiz_results`, `activity_progress`, `certificates`, `totalPoints`, and `badges` are all preserved. Revoke removes *access*, not *history*. The student keeps any earned certificate and can re-request access at any time (overwrites the request back to `pending`).
+
+| HTTP Status | Code | What it means |
+|---|---|---|
+| `200` | — | Revoked. Enrollment doc(s) deleted, request set to `revoked`, audit row written. |
+| `404` | `NOT_FOUND` | No enrollment request exists for this `{uid}_{courseId}`. |
+| `409` | `NOT_REVOCABLE` | The request is not in `approved` state — nothing to revoke. |
+
+> **Admin roster note:** to see who currently has premium access (so you can pick someone to revoke), call `GET /v1/enrollment-requests?status=approved`. Because web enrollment is request-only, the set of `approved` requests is the set of enrolled students. (Enrollments created out-of-band via admin direct `POST /enrollments {userId}` have no request doc and are **not** revocable through this endpoint — a documented limitation.)
 
 > **Mobile coordination note (for Ikmal):** The premium enrollment gate is **inert on all free / absent-tier courses** — mobile behavior for free courses is completely unchanged. For premium courses, content/chapter/quiz/activity reads now return `403 PREMIUM_NOT_ENROLLED` when the student is not enrolled. Mobile must handle this 403 gracefully without crashing (a "request access" screen or a toast is sufficient for the pilot). The gate only activates when an admin explicitly labels a course `accessTier: "premium"`.
 

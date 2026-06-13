@@ -6,7 +6,7 @@ This guide is written for backend developers maintaining or extending the `lms-b
 **Database:** Firestore via Admin SDK  
 **Storage:** Google Cloud Storage via Admin SDK  
 **Auth:** Firebase Authentication with custom claims  
-**Backend version:** v3.1 (Phases 1–3 complete, combined progress percentage)
+**Backend version:** v3.2 (combined progress percentage; premium tier-aware enrollment gate + request/approve/decline/revoke lifecycle; quiz short-answer grading, metadata, timer & per-question image fields)
 
 ---
 
@@ -38,8 +38,9 @@ lms-be-firebase/
 │   │   ├── middleware/
 │   │   │   ├── verifyToken.ts        # Firebase ID token verification
 │   │   │   ├── requireRole.ts        # Role-based route guard
-│   │   │   ├── requirePublishedCourse.ts  # Course publication gate
-│   │   │   └── checkEnrollment.ts    # Enrollment gate for course-scoped routes
+│   │   │   ├── requirePublishedCourse.ts    # Course publication gate
+│   │   │   ├── requirePremiumEnrollment.ts  # Tier-aware enrollment gate (premium courses only)
+│   │   │   └── checkEnrollment.ts    # ⚠️ dead code — superseded by requirePremiumEnrollment, wired to nothing
 │   │   ├── routes/
 │   │   │   ├── auth.ts
 │   │   │   ├── users.ts
@@ -50,7 +51,8 @@ lms-be-firebase/
 │   │   │   ├── content.ts
 │   │   │   ├── certificates.ts
 │   │   │   ├── certificatesUser.ts   # GET /v1/certificates/me — all certs for current user
-│   │   │   ├── enrollments.ts        # ⚠️ file exists but NOT mounted in index.ts
+│   │   │   ├── enrollments.ts        # mounted — self-enroll (free) + admin enroll-other
+│   │   │   ├── enrollmentRequests.ts # mounted — premium request/approve/decline/revoke lifecycle
 │   │   │   ├── progress.ts
 │   │   │   ├── storage.ts
 │   │   │   ├── media.ts
@@ -59,6 +61,7 @@ lms-be-firebase/
 │   │       ├── response.ts           # success() and error() envelope helpers
 │   │       ├── badges.ts             # checkAndAwardBadges utility + BADGE_REGISTRY
 │   │       ├── courseProgress.ts     # recalculateCourseProgress — combined chapter+activity %
+│   │       ├── enrollment.ts         # createEnrollmentIfAbsent — shared "create iff absent" helper
 │   │       └── chatbotAccess.ts      # resolveChatbotEnabled — role-bypass + flag + env default
 │   ├── scripts/
 │   │   ├── seedQuiz.mjs              # Seed a test quiz into a course
@@ -119,7 +122,7 @@ Incoming request
  Response sent (or global error handler on uncaught exception)
 ```
 
-The key insight is that middleware is applied in registration order and each piece of middleware either calls `next()` to continue the chain or calls `res.json()` to short-circuit and end the request. If a middleware short-circuits (for example, `verifyToken` returns `401` because the token is invalid), none of the subsequent middleware or the route handler runs. This is why middleware order matters — placing `checkEnrollment` before `requireRole` on a route would mean enrolled users without the right role get through the enrollment check before being rejected, which is the wrong order.
+The key insight is that middleware is applied in registration order and each piece of middleware either calls `next()` to continue the chain or calls `res.json()` to short-circuit and end the request. If a middleware short-circuits (for example, `verifyToken` returns `401` because the token is invalid), none of the subsequent middleware or the route handler runs. This is why middleware order matters — the canonical content-read order is `verifyToken → requirePublishedCourse → requirePremiumEnrollment → handler`, so an unpublished course is rejected with `404` before the gate ever runs an enrollment query.
 
 ---
 
@@ -149,15 +152,33 @@ Takes one or more role strings as arguments and returns a middleware function �
 
 **Used by:** Admin-only routes, either as `router.use(requireRole('admin'))` at the router level or as a per-route argument.
 
-### `checkEnrollment`
+### `checkEnrollment` *(dead code — superseded)*
 
 **Location:** `src/middleware/checkEnrollment.ts`
 
-Verifies that the authenticated user is enrolled in the course identified by `req.params.courseId`. It requires `verifyToken` to have already run. Admin users bypass this check entirely — the middleware checks `req.user.role === 'admin'` and calls `next()` immediately if true. For non-admin users, it queries the `enrollments` collection for a document matching `{ userId: req.user.uid, courseId: req.params.courseId }`. If no matching document is found, it sends `403`.
+A *blanket* enrollment gate: for non-admin users it queries `enrollments` for `{ userId, courseId }` and sends `403` if absent. It is **not wired into any route** and must not be revived. It was superseded by `requirePremiumEnrollment` (below), which gates only **premium** courses — mounting the blanket version would gate *free* courses too and, since web enrollment is request-only, lock students out of the open pilot path. Treat this file as historical.
 
-**Critical dependency:** This middleware reads `courseId` from `req.params.courseId`. It only works correctly on routes where the Express router has `mergeParams: true` set, because chapter and quiz routes are sub-routers mounted under `/courses/:courseId/...` — without `mergeParams: true`, `req.params.courseId` would be undefined in the child router. All course-scoped routers in this codebase already set `mergeParams: true`.
+---
 
-**Used by:** Not currently applied to any mounted route. The middleware is defined and functional, but all course-scoped content routes now use `requirePublishedCourse` instead. It will be reinstated once the enrollment router is mounted and enrollment-gated access is fully enforced.
+### `requirePremiumEnrollment`
+
+**Location:** `src/middleware/requirePremiumEnrollment.ts`
+
+The real, tier-aware enrollment gate. Requires `verifyToken` to have run. It is **self-sufficient** — it does its own course read and does not depend on `requirePublishedCourse` (one target route, the quiz submit, gates on `verifyToken` only). Logic, in order:
+
+1. No `req.user` → `401 UNAUTHORIZED`.
+2. `req.user.role === 'admin'` → `next()` (admins read everything).
+3. No `req.params.courseId` → `400 BAD_REQUEST`.
+4. Course missing → `404 NOT_FOUND` (no existence leak).
+5. `accessTier !== 'premium'` (i.e. `free` or absent) → `next()` — **inert on every free/legacy course; today's behavior unchanged.**
+6. Premium: query `enrollments` for `{ userId, courseId }`; found → `next()`, else → `403 PREMIUM_NOT_ENROLLED`.
+7. On throw → `500 ENROLLMENT_GATE_FAILED`.
+
+Because step 5 short-circuits on all free/absent-tier courses, the gate is **additive and reversible by data** — flip a course's `accessTier` back to `free` and it fully reverts, gate included. The per-course `accessTier` is the only control (PRD15 deliberately does **not** consume a global feature flag).
+
+**Critical dependency:** reads `req.params.courseId`, so the sub-router needs `mergeParams: true` (all course-scoped routers already set this).
+
+**Used by:** all 10 student content reads/submits, placed immediately after `requirePublishedCourse` (or after `verifyToken` where publish-gate is absent): chapters GET ×2, content GET, quizzes GET ×2 + `/result` + submit, activities GET ×2 + submit.
 
 ---
 
@@ -167,9 +188,9 @@ Verifies that the authenticated user is enrolled in the course identified by `re
 
 Verifies that the course identified by `req.params.courseId` exists and has `isPublished === true`. It requires `verifyToken` to have already run. Admin users bypass this check entirely — they can access unpublished courses for authoring and moderation. For all other roles, if the course does not exist or is not published, the middleware sends `404` (not `403`) — intentionally matching the behaviour of the courses GET endpoints to avoid leaking the existence of unpublished content.
 
-This middleware replaced `checkEnrollment` as the primary access gate on course-scoped student routes. Any authenticated student can now read chapters, quizzes, activities, and content for any published course regardless of enrollment status. Enrollment is tracked in the `enrollments` collection but is not currently enforced as an access gate on content routes.
+This is the **publish** gate; `requirePremiumEnrollment` is the separate **tier/enrollment** gate that runs after it. Free-course content is open to any authenticated student (publish gate only); premium-course content additionally requires an `enrollments` doc.
 
-**Critical dependency:** Like `checkEnrollment`, this middleware reads `courseId` from `req.params.courseId` and therefore only works correctly on sub-routers with `mergeParams: true` set.
+**Critical dependency:** reads `courseId` from `req.params.courseId` and therefore only works correctly on sub-routers with `mergeParams: true` set.
 
 **Used by:** Chapter GET routes, quiz GET routes, quiz submit route, all activity routes, content GET route, and progress routes.
 
@@ -186,22 +207,23 @@ The mounting tree in `index.ts` looks like this:
 /v1/auth                                  → routes/auth.ts
 /v1/users                                 → routes/users.ts        (router.use(verifyToken, requireRole('admin')))
 /v1/courses                               → routes/courses.ts
-/v1/courses/:courseId/chapters            → routes/chapters.ts       (mergeParams: true, requirePublishedCourse per route)
-/v1/courses/:courseId/quizzes             → routes/quizzes.ts        (mergeParams: true, requirePublishedCourse per route)
-/v1/courses/:courseId/activities          → routes/activities.ts     (mergeParams: true, requirePublishedCourse per route)
-/v1/courses/:courseId/content             → routes/content.ts        (mergeParams: true, requirePublishedCourse)
+/v1/courses/:courseId/chapters            → routes/chapters.ts       (mergeParams: true; reads: requirePublishedCourse + requirePremiumEnrollment)
+/v1/courses/:courseId/quizzes             → routes/quizzes.ts        (mergeParams: true; reads+submit: requirePublishedCourse + requirePremiumEnrollment)
+/v1/courses/:courseId/activities          → routes/activities.ts     (mergeParams: true; reads+submit: requirePublishedCourse + requirePremiumEnrollment)
+/v1/courses/:courseId/content             → routes/content.ts        (mergeParams: true; requirePublishedCourse + requirePremiumEnrollment)
 /v1/courses/:courseId/progress            → routes/progress.ts       (mergeParams: true, router.use(verifyToken))
 /v1/courses/:courseId/certificates        → routes/certificates.ts   (mergeParams: true, router.use(verifyToken))
 /v1/certificates                          → routes/certificatesUser.ts (router.use(verifyToken))
+/v1/enrollments                           → routes/enrollments.ts    (router.use(verifyToken); self-enroll gated to published+free)
+/v1/enrollment-requests                   → routes/enrollmentRequests.ts (router.use(verifyToken); admin actions add requireRole('admin'))
 /v1/storage                               → routes/storage.ts        (router.use(verifyToken))
 /v1/leaderboard                           → routes/leaderboard.ts
 /v1/media                                 → routes/media.ts
-
-⚠️  NOT MOUNTED: routes/enrollments.ts exists with full implementation but is absent from index.ts.
-    All /v1/enrollments/* endpoints are currently unreachable (return 404).
 ```
 
-An important detail about the users router: it applies `verifyToken` and `requireRole('admin')` at the router level using `router.use(...)`. This means every route registered on that router — including routes added in the future — is automatically admin-protected without needing to specify it per route. This is the right pattern for route groups where every endpoint shares the same access requirements. For route groups with mixed access (like quizzes, where GET is enrolled-student and POST is admin), the middleware is applied per route instead.
+Both `/v1/enrollments` and `/v1/enrollment-requests` are mounted (PRD15/18). The `enrollments` router handles self-enroll (published + free only) and admin enroll-other; `enrollmentRequests` handles the premium request → approve / decline / revoke lifecycle.
+
+An important detail about the users router: it applies `verifyToken` and `requireRole('admin')` at the router level using `router.use(...)`. This means every route registered on that router — including routes added in the future — is automatically admin-protected without needing to specify it per route. This is the right pattern for route groups where every endpoint shares the same access requirements. For route groups with mixed access (like quizzes, where GET is student-readable and POST is admin), the middleware is applied per route instead.
 
 The users router exposes five endpoints, all admin-only:
 
@@ -227,13 +249,17 @@ All collections are at the Firestore root level except chapters, quizzes, and ga
 
 The optional `chatbotEnabled` field gates access to the AI chatbot. It has three states: absent (admin never toggled — resolved against the `CHATBOT_DEFAULT_ACCESS` env default), `true` (explicitly granted), or `false` (explicitly revoked). It is **never written at signup** — that omission is what makes a future default flip migration-free. Every API response that includes a user profile emits an already-resolved boolean via `resolveChatbotEnabled` in `utils/chatbotAccess.ts`; `admin` and `instructor` roles always resolve to `true` regardless of the stored value.
 
-**`courses/{courseId}`** — Top-level course documents. `isPublished` controls visibility for non-admin users at the API layer. `totalChapters` and `totalActivities` are integer counter fields maintained by the chapter and activity create/delete handlers using `FieldValue.increment(±1)`.
+**`courses/{courseId}`** — Top-level course documents. `isPublished` controls visibility for non-admin users at the API layer. The optional `accessTier` (`"free" | "premium"`, absent ⇒ `free`) controls the enrollment gate: `free`/absent courses are open to any authenticated student, `premium` courses require an `enrollments` doc (enforced by `requirePremiumEnrollment`). `totalChapters` and `totalActivities` are integer counter fields maintained by the chapter and activity create/delete handlers using `FieldValue.increment(±1)`.
 
 **`courses/{courseId}/chapters/{chapterId}`** — Subcollection under each course. The `order` field is an integer used for sorted retrieval. The `isPublished` field on chapters is persisted by the backend but is not currently used for server-side filtering — the frontend is responsible for filtering unpublished chapters from the display. Media is stored as two fields: `mediaType` (string, e.g. `"youtube"`) and `mediaUrl` (URL string). The old `videoUrl` field has been removed — run `scripts/migrate-videourl-to-mediaurl.mjs` on any database that still has legacy `videoUrl` documents.
 
-**`courses/{courseId}/quizzes/{quizId}`** — Subcollection under each course. Questions are stored as an array of objects with this shape in Firestore: `{ questionText, correctAnswerIndex, options[], type, points, correctAnswerText }`. The `correctAnswerIndex` is a zero-based integer pointing to the correct option. The student-facing GET response strips `correctAnswerIndex` and renames `questionText` to `question`.
+**`courses/{courseId}/quizzes/{quizId}`** — Subcollection under each course. Questions are stored as an array of objects: `{ questionText, type, options[], correctAnswerIndex, correctAnswerText, points, imageUrl }`. `type` is `"multipleChoice"` (uses `correctAnswerIndex`, a zero-based integer) or `"shortAnswer"` (uses `correctAnswerText`, graded trim + lowercase). Optional per-question `imageUrl` is a storage path. The quiz doc also carries optional metadata: `passingGrade`, `allowRetake`, `showAnswers`, `timeLimitMinutes` (soft client-side timer in minutes — **not** server-enforced), plus `type`/`gamificationType` labels. The student-facing GET runs `toStudentQuestions`, a **whitelist** returning only `{ questionText, type, options, points, imageUrl }` — it strips `correctAnswerIndex`/`correctAnswerText` and **keeps `questionText`** (it does *not* rename to `question`; an older refactor removed that rename). The `questions` array is persisted verbatim on write, so new optional fields round-trip without write-handler changes.
 
-**`enrollments/{enrollmentId}`** — Each document represents one user-course enrollment pair. The document ID is auto-generated. Documents have `userId`, `courseId`, and `enrolledAt`.
+**`enrollments/{enrollmentId}`** — Each document represents one user-course enrollment pair. The document ID is auto-generated (dedup is by query, not composite ID). Documents have `userId`, `courseId`, and `enrolledAt`. This collection is the **access truth** for premium courses — `requirePremiumEnrollment` reads its existence; present ⇒ access. Docs are created by `createEnrollmentIfAbsent` (`utils/enrollment.ts`) from both self-enroll and premium approval, and hard-deleted by admin revoke. Index: `(userId ASC, courseId ASC)`.
+
+**`enrollment_requests/{uid}_{courseId}`** — Composite-key document (one per student per course). The premium request lifecycle record. Fields: `userId`, `courseId`, `status` (`"pending" | "approved" | "declined" | "revoked"`), `requestedAt`, and on decision `decidedAt`, `decidedBy`, optional `declineReason`. Re-requesting after a decline/revoke overwrites the same doc back to `pending`. Top-level so the admin queue is a single `where("status","==", …)` query; composite index `(status ASC, requestedAt DESC)`.
+
+**`enrollment_audit/{auditId}`** — Append-only revoke log. Auto-ID. Fields: `action` (`"revoke"`), `userId`, `courseId`, `actorUid` (the admin), optional `reason`, `revokedAt`. Admin-SDK-written and never client-read (no `firestore.rules` entry needed — default-deny is correct).
 
 **`progress/{uid_courseId}`** — The document ID is a composite key in the format `{uid}_{courseId}`. This makes progress lookups a single document read rather than a query, which is more efficient and predictable. The `completedChapters` field is an array of chapter ID strings. The `percentage` field reflects combined progress across both chapters and activities — it is computed by `recalculateCourseProgress` and written transactionally whenever a chapter is marked complete or an activity is submitted.
 
@@ -322,6 +348,7 @@ After each call, callers map the returned badge IDs through `BADGE_REGISTRY` (ex
 | `STORAGE_BUCKET` | Yes (for storage routes) | GCS bucket name without `gs://` prefix. Used for both explicit init and ADC fallback. |
 | `CORS_ORIGIN` | No | Currently unused — the CORS configuration in `index.ts` is hardcoded to `origin: "*"`. The env var line is commented out. Restore it before any production deployment that requires CORS restriction. |
 | `CHATBOT_DEFAULT_ACCESS` | No | Controls the fallback for students whose `chatbotEnabled` field is absent (never admin-toggled). `"false"` = denied (thesis pilot default). Flip to `"true"` and redeploy at public launch — no Firestore migration needed. `admin` and `instructor` accounts bypass this entirely. |
+| `FEATURE_ASSESSMENT`, `FEATURE_PREMIUM_ENROLLMENT` | No | **Inert placeholders — no code reads them.** Declared in `.env.example` for a future global-flag mechanism that was never built. Premium enrollment *is* live but is gated per-course by `accessTier`, not by a flag (PRD15 §2.1). Do not assume flipping these changes any behavior. |
 
 If all four Admin SDK variables are present, the SDK initializes with explicit service account credentials. If any are missing, it falls back to ADC with `storageBucket` passed explicitly. For local development with the Firebase emulator, ADC works automatically — you do not need to provide the service account variables. For production deployment, always use explicit credentials via environment config.
 
@@ -390,9 +417,9 @@ These scripts are idempotent in the sense that they skip documents that do not n
 
 These are issues in the current implementation that the next developer to touch the codebase should be aware of. They are ordered by production risk, not by effort to fix.
 
-**No content route enforces enrollment.** All course-scoped student routes — chapters, quizzes, activities, content, and progress — gate access on `requirePublishedCourse` (course exists and is published) rather than enrollment. Any authenticated student can read the content of any published course regardless of whether they have an `enrollments` document. This is a deliberate MVP simplification; if enrollment-gated access is required before launch, `checkEnrollment` needs to be reinstated on the relevant routes and the enrollment router must also be mounted.
+**Free-course content is open by design.** `requirePremiumEnrollment` is inert on `free`/absent-tier courses, so any authenticated student can read any *published, free* course's content without an `enrollments` document. This is intentional (PRD15 keeps the pilot path click-and-play) — only `premium`-tier courses are enrollment-gated. Not a defect; noted so it is not re-filed as one.
 
-**Enrollment router is not mounted.** `routes/enrollments.ts` is fully implemented but has no corresponding `app.use(...)` line in `index.ts`. All `/v1/enrollments/*` endpoints return `404`. Add `import enrollmentsRouter from "./routes/enrollments.js"` and `app.use("/v1/enrollments", enrollmentsRouter)` to `index.ts` to restore enrollment functionality.
+**`allowRetake`/`showAnswers`/`timeLimitMinutes` are not server-enforced.** These quiz fields are persisted and returned but never enforced by the submit handler — `POST .../quizzes/:quizId/submit` accepts unlimited submissions regardless of `allowRetake`, awarding points each time. Retake gating, answer reveal, and the countdown are **frontend-only**. A real anti-farm fix (suppress points on repeat / one-submission guard) is an edit to shared submit behavior — coordinate with mobile (Ikmal) before changing.
 
 **Quiz question schema drift between admin write and student read.** Questions are stored in Firestore with `questionText` as the field name for question text. The admin create/update interface models the field as `question` in the TypeScript `QuizQuestion` interface. The student normalization function correctly reads `questionText` from the stored document. However, if an admin client submits a question object using `question` instead of `questionText`, the data is stored with the wrong field name and students will see blank questions. The TypeScript interface and the stored schema are out of sync, and there is no runtime validation that catches this mismatch.
 
@@ -408,6 +435,7 @@ These are issues in the current implementation that the next developer to touch 
 
 #### Resolved
 
+- ~~**No content route enforces enrollment / Enrollment router is not mounted.**~~ — Resolved (PRD15/18). `/v1/enrollments` and `/v1/enrollment-requests` are both mounted; `requirePremiumEnrollment` gates premium-tier content on all 10 student routes; the request → approve / decline / revoke lifecycle is live with `enrollment_requests` + `enrollment_audit`. `checkEnrollment` stays dead (superseded, not revived). Free courses intentionally remain open.
 - ~~**Certificate eligibility check uses `bestScore` field semantics that are pending confirmation.**~~ — Now resolved. The handler checks `activityProgress.bestScorePercent !== 100`. This is the correct field; `bestScore` stores raw proportional points while `bestScorePercent` is the 0–100 normalised percentage. The comment flagging this as pending confirmation has been removed.
 - ~~**Missing Firestore composite index for leaderboard**~~ — `(isActive ASC, totalPoints DESC)` on `users` already declared in `firestore.indexes.json`. Deploy with `firebase deploy --only firestore:indexes` if not yet live.
 - ~~**Missing Firestore composite index for certificates**~~ — `(userId ASC, issuedAt DESC)` on `certificates` added to `firestore.indexes.json` (2026-04-30). Required by `GET /v1/certificates/me`; was causing 500s on the dashboard. Deploy with `firebase deploy --only firestore:indexes`.
@@ -419,9 +447,9 @@ These are issues in the current implementation that the next developer to touch 
 
 When adding a new endpoint to the backend, work through this checklist to avoid common oversights.
 
-Decide which route file it belongs in, or create a new route file and mount it in `index.ts`. **Mounting is a manual step** — a new route file that is not added to `index.ts` will silently return `404` with no build-time warning (the enrollment router is the current example of this trap).
+Decide which route file it belongs in, or create a new route file and mount it in `index.ts`. **Mounting is a manual step** — a new route file that is not added to `index.ts` will silently return `404` with no build-time warning.
 
-Apply the correct middleware — use `verifyToken` for all authenticated routes, add `requireRole('admin')` for admin-only operations, and add `requirePublishedCourse` for any route that accesses course-scoped content on behalf of a student (this gates on publication status, not enrollment). If the route is in a sub-router mounted under `/courses/:courseId/...`, ensure the router is created with `Router({ mergeParams: true })` so that `req.params.courseId` is accessible to both the route handler and `requirePublishedCourse`.
+Apply the correct middleware — use `verifyToken` for all authenticated routes, add `requireRole('admin')` for admin-only operations, and for any route that serves course-scoped content to a student, chain `requirePublishedCourse` (publish gate) **then** `requirePremiumEnrollment` (tier/enrollment gate) — in that order. Do **not** reach for the dead `checkEnrollment`. If the route is in a sub-router mounted under `/courses/:courseId/...`, ensure the router is created with `Router({ mergeParams: true })` so that `req.params.courseId` is accessible to the handler and both gates.
 
 Use the `success()` and `error()` utilities from `utils/response.ts` for all responses. Wrap the entire handler body in a `try/catch` and log structured context in the catch block — at minimum include `uid: req.user?.uid` and any relevant resource IDs.
 

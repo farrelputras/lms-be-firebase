@@ -8,6 +8,7 @@ import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
 import {checkAndAwardBadges} from "../utils/badges.js";
 import {resolveChatbotEnabled} from "../utils/chatbotAccess.js";
+import {createEnrollmentIfAbsent} from "../utils/enrollment.js";
 import {success, error} from "../utils/response.js";
 
 const router = Router();
@@ -226,6 +227,15 @@ type BatchStudentRow = {
   name?: string;
   email?: string;
   password?: string;
+  courseId?: string;
+};
+
+// PRD20 — Batch Enrollment: per-row enrollment outcome, independent of the
+// registration outcome above. Present only when the row carried a courseId.
+type BatchEnrollmentResult = {
+  courseId: string;
+  status: "enrolled" | "already_enrolled" | "course_not_found" | "failed";
+  reason?: string;
 };
 
 type BatchResultRow = {
@@ -233,6 +243,7 @@ type BatchResultRow = {
   status: "created" | "skipped" | "failed";
   uid?: string;
   reason?: string;
+  enrollment?: BatchEnrollmentResult;
 };
 
 // Runs `fn` over `items` with at most `limit` in flight at once —
@@ -262,6 +273,9 @@ const mapWithConcurrency = async <T, R>(
 };
 
 // POST /users/batch — PRD14 batch register (admin-only, via router.use above)
+// + PRD20 batch enrollment: an optional per-row `courseId` enrolls the
+// resulting (created or pre-existing) uid into that course, admin-bypass
+// (ignores isPublished/accessTier), raw `enrollments` doc only.
 router.post("/batch", async (req, res) => {
   const {students, defaultPassword} = req.body as {
     students?: BatchStudentRow[];
@@ -285,11 +299,51 @@ router.post("/batch", async (req, res) => {
   const createdBy = req.user!.uid;
 
   try {
+    // PRD20 — prefetch distinct course validity once, before the per-row
+    // loop, instead of re-reading the same course once per row.
+    const distinctCourseIds = Array.from(
+      new Set(
+        students
+          .map((r) => r.courseId?.trim())
+          .filter((id): id is string => Boolean(id))
+      )
+    );
+
+    const courseValid = new Map<string, boolean>();
+    if (distinctCourseIds.length > 0) {
+      const refs = distinctCourseIds.map((id) => adminDb.collection("courses").doc(id));
+      const snaps = await adminDb.getAll(...refs);
+      snaps.forEach((snap, i) => courseValid.set(distinctCourseIds[i], snap.exists));
+    }
+
     const results = await mapWithConcurrency(
       students,
       BATCH_CONCURRENCY,
       async (row): Promise<BatchResultRow> => {
         const email = (row.email || "").trim();
+        const courseId = row.courseId?.trim() || undefined;
+
+        // PRD20 — enrolls whichever uid the registration step resolves to
+        // (created or pre-existing/skipped); never runs for failed rows.
+        const enrollIfNeeded = async (
+          uid: string | undefined
+        ): Promise<BatchEnrollmentResult | undefined> => {
+          if (!courseId) return undefined;
+          if (!uid) return {courseId, status: "failed", reason: "No account to enroll"};
+          if (!courseValid.get(courseId)) {
+            return {courseId, status: "course_not_found"};
+          }
+          try {
+            const enrollResult = await createEnrollmentIfAbsent(uid, courseId);
+            return {
+              courseId,
+              status: enrollResult.created ? "enrolled" : "already_enrolled",
+            };
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : "Failed to enroll";
+            return {courseId, status: "failed", reason: msg};
+          }
+        };
 
         if (!email || !EMAIL_RE.test(email)) {
           return {email: email || "(missing)", status: "failed", reason: "Invalid or missing email"};
@@ -325,11 +379,19 @@ router.post("/batch", async (req, res) => {
 
           await checkAndAwardBadges(userRecord.uid, adminDb, {type: "account_created"});
 
-          return {email, status: "created", uid: userRecord.uid};
+          const enrollment = await enrollIfNeeded(userRecord.uid);
+          return {email, status: "created", uid: userRecord.uid, enrollment};
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : "Failed to create user";
           if (/already exists/i.test(msg)) {
-            return {email, status: "skipped", reason: "Email already registered"};
+            let uid: string | undefined;
+            try {
+              uid = (await adminAuth.getUserByEmail(email)).uid;
+            } catch {
+              uid = undefined;
+            }
+            const enrollment = await enrollIfNeeded(uid);
+            return {email, status: "skipped", reason: "Email already registered", uid, enrollment};
           }
           return {email, status: "failed", reason: msg};
         }
@@ -340,9 +402,17 @@ router.post("/batch", async (req, res) => {
       (acc, r) => {
         acc.total++;
         acc[r.status]++;
+        if (r.enrollment) {
+          if (r.enrollment.status === "enrolled") acc.enrolled++;
+          else if (r.enrollment.status === "already_enrolled") acc.alreadyEnrolled++;
+          else acc.enrollFailed++;
+        }
         return acc;
       },
-      {total: 0, created: 0, skipped: 0, failed: 0}
+      {
+        total: 0, created: 0, skipped: 0, failed: 0,
+        enrolled: 0, alreadyEnrolled: 0, enrollFailed: 0,
+      }
     );
 
     res.status(201).json(success({summary, results}));

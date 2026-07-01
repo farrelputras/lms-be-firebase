@@ -6,7 +6,9 @@ import {
 } from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
+import {checkAndAwardBadges} from "../utils/badges.js";
 import {resolveChatbotEnabled} from "../utils/chatbotAccess.js";
+import {createEnrollmentIfAbsent} from "../utils/enrollment.js";
 import {success, error} from "../utils/response.js";
 
 const router = Router();
@@ -212,6 +214,211 @@ router.post("/upsert", async (req, res) => {
     res.status(500).json(
       error("UPSERT_FAILED", "Failed to upsert user profile")
     );
+  }
+});
+
+// PRD14 — Batch Register: max rows per upload, kept well under the
+// 60s function timeout when combined with the concurrency cap below.
+const MAX_BATCH_ROWS = 100;
+const BATCH_CONCURRENCY = 5;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+type BatchStudentRow = {
+  name?: string;
+  email?: string;
+  password?: string;
+  courseId?: string;
+};
+
+// PRD20 — Batch Enrollment: per-row enrollment outcome, independent of the
+// registration outcome above. Present only when the row carried a courseId.
+type BatchEnrollmentResult = {
+  courseId: string;
+  status: "enrolled" | "already_enrolled" | "course_not_found" | "failed";
+  reason?: string;
+};
+
+type BatchResultRow = {
+  email: string;
+  status: "created" | "skipped" | "failed";
+  uid?: string;
+  reason?: string;
+  enrollment?: BatchEnrollmentResult;
+};
+
+// Runs `fn` over `items` with at most `limit` in flight at once —
+// bounded concurrency avoids both Auth rate limits (full parallel)
+// and the function timeout (full serial) for large batches.
+const mapWithConcurrency = async <T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> => {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  };
+
+  const workers = Array.from(
+    {length: Math.min(limit, items.length)},
+    () => worker()
+  );
+  await Promise.all(workers);
+  return results;
+};
+
+// POST /users/batch — PRD14 batch register (admin-only, via router.use above)
+// + PRD20 batch enrollment: an optional per-row `courseId` enrolls the
+// resulting (created or pre-existing) uid into that course, admin-bypass
+// (ignores isPublished/accessTier), raw `enrollments` doc only.
+router.post("/batch", async (req, res) => {
+  const {students, defaultPassword} = req.body as {
+    students?: BatchStudentRow[];
+    defaultPassword?: string;
+  };
+
+  if (!Array.isArray(students) || students.length === 0) {
+    res.status(400).json(
+      error("BAD_REQUEST", "students must be a non-empty array")
+    );
+    return;
+  }
+
+  if (students.length > MAX_BATCH_ROWS) {
+    res.status(400).json(
+      error("BATCH_TOO_LARGE", `Max ${MAX_BATCH_ROWS} students per upload`)
+    );
+    return;
+  }
+
+  const createdBy = req.user!.uid;
+
+  try {
+    // PRD20 — prefetch distinct course validity once, before the per-row
+    // loop, instead of re-reading the same course once per row.
+    const distinctCourseIds = Array.from(
+      new Set(
+        students
+          .map((r) => r.courseId?.trim())
+          .filter((id): id is string => Boolean(id))
+      )
+    );
+
+    const courseValid = new Map<string, boolean>();
+    if (distinctCourseIds.length > 0) {
+      const refs = distinctCourseIds.map((id) => adminDb.collection("courses").doc(id));
+      const snaps = await adminDb.getAll(...refs);
+      snaps.forEach((snap, i) => courseValid.set(distinctCourseIds[i], snap.exists));
+    }
+
+    const results = await mapWithConcurrency(
+      students,
+      BATCH_CONCURRENCY,
+      async (row): Promise<BatchResultRow> => {
+        const email = (row.email || "").trim();
+        const courseId = row.courseId?.trim() || undefined;
+
+        // PRD20 — enrolls whichever uid the registration step resolves to
+        // (created or pre-existing/skipped); never runs for failed rows.
+        const enrollIfNeeded = async (
+          uid: string | undefined
+        ): Promise<BatchEnrollmentResult | undefined> => {
+          if (!courseId) return undefined;
+          if (!uid) return {courseId, status: "failed", reason: "No account to enroll"};
+          if (!courseValid.get(courseId)) {
+            return {courseId, status: "course_not_found"};
+          }
+          try {
+            const enrollResult = await createEnrollmentIfAbsent(uid, courseId);
+            return {
+              courseId,
+              status: enrollResult.created ? "enrolled" : "already_enrolled",
+            };
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : "Failed to enroll";
+            return {courseId, status: "failed", reason: msg};
+          }
+        };
+
+        if (!email || !EMAIL_RE.test(email)) {
+          return {email: email || "(missing)", status: "failed", reason: "Invalid or missing email"};
+        }
+
+        const password = (row.password || defaultPassword || "").trim();
+        if (!password) {
+          return {email, status: "failed", reason: "Missing password"};
+        }
+
+        const displayName = row.name?.trim() || email.split("@")[0];
+
+        try {
+          const userRecord = await adminAuth.createUser({
+            email,
+            password,
+            displayName,
+          });
+
+          await adminAuth.setCustomUserClaims(userRecord.uid, {role: "student"});
+
+          await adminDb.collection("users").doc(userRecord.uid).set({
+            name: displayName,
+            email,
+            role: "student",
+            totalPoints: 0,
+            isActive: true,
+            createdAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+            createdVia: "batch",
+            createdBy,
+          });
+
+          await checkAndAwardBadges(userRecord.uid, adminDb, {type: "account_created"});
+
+          const enrollment = await enrollIfNeeded(userRecord.uid);
+          return {email, status: "created", uid: userRecord.uid, enrollment};
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : "Failed to create user";
+          if (/already exists/i.test(msg)) {
+            let uid: string | undefined;
+            try {
+              uid = (await adminAuth.getUserByEmail(email)).uid;
+            } catch {
+              uid = undefined;
+            }
+            const enrollment = await enrollIfNeeded(uid);
+            return {email, status: "skipped", reason: "Email already registered", uid, enrollment};
+          }
+          return {email, status: "failed", reason: msg};
+        }
+      }
+    );
+
+    const summary = results.reduce(
+      (acc, r) => {
+        acc.total++;
+        acc[r.status]++;
+        if (r.enrollment) {
+          if (r.enrollment.status === "enrolled") acc.enrolled++;
+          else if (r.enrollment.status === "already_enrolled") acc.alreadyEnrolled++;
+          else acc.enrollFailed++;
+        }
+        return acc;
+      },
+      {
+        total: 0, created: 0, skipped: 0, failed: 0,
+        enrolled: 0, alreadyEnrolled: 0, enrollFailed: 0,
+      }
+    );
+
+    res.status(201).json(success({summary, results}));
+  } catch (err) {
+    console.error("[POST /users/batch]", {uid: createdBy, rows: students.length}, err);
+    res.status(500).json(error("BATCH_FAILED", "Failed to process batch registration"));
   }
 });
 

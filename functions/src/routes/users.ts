@@ -6,6 +6,7 @@ import {
 } from "../firebaseAdmin.js";
 import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
+import {checkAndAwardBadges} from "../utils/badges.js";
 import {resolveChatbotEnabled} from "../utils/chatbotAccess.js";
 import {success, error} from "../utils/response.js";
 
@@ -212,6 +213,142 @@ router.post("/upsert", async (req, res) => {
     res.status(500).json(
       error("UPSERT_FAILED", "Failed to upsert user profile")
     );
+  }
+});
+
+// PRD14 — Batch Register: max rows per upload, kept well under the
+// 60s function timeout when combined with the concurrency cap below.
+const MAX_BATCH_ROWS = 100;
+const BATCH_CONCURRENCY = 5;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+type BatchStudentRow = {
+  name?: string;
+  email?: string;
+  password?: string;
+};
+
+type BatchResultRow = {
+  email: string;
+  status: "created" | "skipped" | "failed";
+  uid?: string;
+  reason?: string;
+};
+
+// Runs `fn` over `items` with at most `limit` in flight at once —
+// bounded concurrency avoids both Auth rate limits (full parallel)
+// and the function timeout (full serial) for large batches.
+const mapWithConcurrency = async <T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> => {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  };
+
+  const workers = Array.from(
+    {length: Math.min(limit, items.length)},
+    () => worker()
+  );
+  await Promise.all(workers);
+  return results;
+};
+
+// POST /users/batch — PRD14 batch register (admin-only, via router.use above)
+router.post("/batch", async (req, res) => {
+  const {students, defaultPassword} = req.body as {
+    students?: BatchStudentRow[];
+    defaultPassword?: string;
+  };
+
+  if (!Array.isArray(students) || students.length === 0) {
+    res.status(400).json(
+      error("BAD_REQUEST", "students must be a non-empty array")
+    );
+    return;
+  }
+
+  if (students.length > MAX_BATCH_ROWS) {
+    res.status(400).json(
+      error("BATCH_TOO_LARGE", `Max ${MAX_BATCH_ROWS} students per upload`)
+    );
+    return;
+  }
+
+  const createdBy = req.user!.uid;
+
+  try {
+    const results = await mapWithConcurrency(
+      students,
+      BATCH_CONCURRENCY,
+      async (row): Promise<BatchResultRow> => {
+        const email = (row.email || "").trim();
+
+        if (!email || !EMAIL_RE.test(email)) {
+          return {email: email || "(missing)", status: "failed", reason: "Invalid or missing email"};
+        }
+
+        const password = (row.password || defaultPassword || "").trim();
+        if (!password) {
+          return {email, status: "failed", reason: "Missing password"};
+        }
+
+        const displayName = row.name?.trim() || email.split("@")[0];
+
+        try {
+          const userRecord = await adminAuth.createUser({
+            email,
+            password,
+            displayName,
+          });
+
+          await adminAuth.setCustomUserClaims(userRecord.uid, {role: "student"});
+
+          await adminDb.collection("users").doc(userRecord.uid).set({
+            name: displayName,
+            email,
+            role: "student",
+            totalPoints: 0,
+            isActive: true,
+            createdAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+            createdVia: "batch",
+            createdBy,
+          });
+
+          await checkAndAwardBadges(userRecord.uid, adminDb, {type: "account_created"});
+
+          return {email, status: "created", uid: userRecord.uid};
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : "Failed to create user";
+          if (/already exists/i.test(msg)) {
+            return {email, status: "skipped", reason: "Email already registered"};
+          }
+          return {email, status: "failed", reason: msg};
+        }
+      }
+    );
+
+    const summary = results.reduce(
+      (acc, r) => {
+        acc.total++;
+        acc[r.status]++;
+        return acc;
+      },
+      {total: 0, created: 0, skipped: 0, failed: 0}
+    );
+
+    res.status(201).json(success({summary, results}));
+  } catch (err) {
+    console.error("[POST /users/batch]", {uid: createdBy, rows: students.length}, err);
+    res.status(500).json(error("BATCH_FAILED", "Failed to process batch registration"));
   }
 });
 

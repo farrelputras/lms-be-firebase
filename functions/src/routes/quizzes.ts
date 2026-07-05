@@ -6,8 +6,12 @@ import {verifyToken} from "../middleware/verifyToken.js";
 import {requireRole} from "../middleware/requireRole.js";
 import {requirePublishedCourse} from "../middleware/requirePublishedCourse.js";
 import {requirePremiumEnrollment} from "../middleware/requirePremiumEnrollment.js";
-import {checkAndAwardBadges, BADGE_REGISTRY} from "../utils/badges.js";
 import {success, error} from "../utils/response.js";
+
+// PRD21 — fixed penalty proportion for `scoringMode: 'penalty'` quizzes.
+// A weight-4 question scores -1 on a wrong answer (0.25 * 4); short-answer
+// and blank answers are never penalized (see submit handler).
+const WRONG_PENALTY_RATIO = 0.25;
 
 interface QuizQuestion {
   questionText: string;
@@ -249,6 +253,7 @@ router.post(
         allowRetake,
         showAnswers,
         timeLimitMinutes,
+        scoringMode,
       } = req.body as {
         title?: string;
         questions?: QuizQuestion[];
@@ -258,6 +263,7 @@ router.post(
         allowRetake?: boolean;
         showAnswers?: boolean;
         timeLimitMinutes?: number;
+        scoringMode?: string;
       };
 
       if (!title || !questions || !Array.isArray(questions)) {
@@ -283,6 +289,9 @@ router.post(
       if (allowRetake !== undefined) quizData.allowRetake = allowRetake;
       if (showAnswers !== undefined) quizData.showAnswers = showAnswers;
       if (timeLimitMinutes !== undefined) quizData.timeLimitMinutes = timeLimitMinutes;
+      if (scoringMode === "standard" || scoringMode === "penalty") {
+        quizData.scoringMode = scoringMode;
+      }
 
       const docRef = await adminDb
         .collection("courses")
@@ -324,6 +333,7 @@ router.patch(
         allowRetake,
         showAnswers,
         timeLimitMinutes,
+        scoringMode,
       } = req.body as {
         title?: string;
         questions?: QuizQuestion[];
@@ -333,6 +343,7 @@ router.patch(
         allowRetake?: boolean;
         showAnswers?: boolean;
         timeLimitMinutes?: number;
+        scoringMode?: string;
       };
 
       const updates: Record<string, unknown> = {
@@ -348,6 +359,9 @@ router.patch(
       if (allowRetake !== undefined) updates.allowRetake = allowRetake;
       if (showAnswers !== undefined) updates.showAnswers = showAnswers;
       if (timeLimitMinutes !== undefined) updates.timeLimitMinutes = timeLimitMinutes;
+      if (scoringMode === "standard" || scoringMode === "penalty") {
+        updates.scoringMode = scoringMode;
+      }
 
       await adminDb
         .collection("courses")
@@ -428,7 +442,7 @@ router.post(
     try {
       const courseId = req.params.courseId as string;
       const quizId = req.params.quizId as string;
-      const {answers} = req.body as {answers?: (number | string)[]};
+      const {answers} = req.body as {answers?: (number | string | null)[]};
 
       if (!answers || !Array.isArray(answers)) {
         res.status(400).json(
@@ -451,6 +465,9 @@ router.post(
 
       const quizData = quizSnap.data();
       const questions = (quizData?.questions as QuizQuestion[]) || [];
+      // PRD21 — quizzes default to 'standard' (today's behavior); admins opt
+      // individual quizzes into 'penalty' via POST/PATCH allowlists above.
+      const scoringMode = quizData?.scoringMode === "penalty" ? "penalty" : "standard";
 
       if (answers.length !== questions.length) {
         res.status(400).json(
@@ -462,12 +479,23 @@ router.post(
         return;
       }
 
+      // PRD21 §5 — a null/undefined entry (or an empty short-answer string) is
+      // a blank, not a wrong answer: it never scores negative, even in penalty mode.
+      const isBlankAnswer = (q: QuizQuestion, answer: number | string | null | undefined) => {
+        if (answer === null || answer === undefined) return true;
+        if (q.type === "shortAnswer") return String(answer).trim() === "";
+        return false;
+      };
+
       let correctCount = 0;
-      let pointsAwarded = 0;
+      let rawScore = 0;
+      let maxScore = 0;
       questions.forEach((q, i) => {
         const answer = answers[i];
-        let isCorrect = false;
+        const weight = q.points || 1;
+        maxScore += weight;
 
+        let isCorrect = false;
         if (q.type === "shortAnswer") {
           if (
             answer != null &&
@@ -483,35 +511,28 @@ router.post(
 
         if (isCorrect) {
           correctCount++;
-          pointsAwarded += (q.points || 1);
+          rawScore += weight;
+        } else if (
+          scoringMode === "penalty" &&
+          q.type !== "shortAnswer" &&
+          !isBlankAnswer(q, answer)
+        ) {
+          // Wrong, non-blank, non-short-answer in penalty mode: subtract the fixed ratio.
+          rawScore -= WRONG_PENALTY_RATIO * weight;
         }
+        // Blank, short-answer wrong/blank, or standard-mode wrong: contributes 0.
       });
+
+      // PRD21 D7 — final score never negative, regardless of how many wrong answers.
+      const flooredScore = Math.max(0, rawScore);
 
       const totalQuestions = questions.length;
       const uid = req.user!.uid;
 
-      await adminDb.collection("users").doc(uid).set({
-        totalPoints: FieldValue.increment(pointsAwarded),
-      }, {merge: true});
-
-      // 1. Submit basic quiz activity check
-      const submittedBadgeIds = await checkAndAwardBadges(uid, adminDb, {
-        type: "activity_submitted",
-        correctCount,
-        totalQuestions,
-      });
-
-      // 2. Leaderboard check (since points were just awarded)
-      const rankBadgeIds = await checkAndAwardBadges(uid, adminDb, {
-        type: "leaderboard_update"
-      });
-
-      // 3. Combine and map to metadata objects
-      const combinedIds = [...submittedBadgeIds, ...rankBadgeIds];
-      const earnedBadges = combinedIds.map(id => ({
-        id,
-        ...BADGE_REGISTRY[id as keyof typeof BADGE_REGISTRY]
-      }));
+      // PRD21 Change 1 — quizzes are pure assessment: no gamification points or
+      // badges are written here anymore (previously: totalPoints increment +
+      // checkAndAwardBadges for "activity_submitted" and "leaderboard_update").
+      const earnedBadges: {id: string}[] = [];
 
       const answerSummary = questions.map((q, i) => {
         const answer = answers[i];
@@ -528,15 +549,27 @@ router.post(
         };
       });
 
+      // PRD21 §6.1 D5 — `score`/`pointsAwarded` field names are kept for
+      // backward-compat with GET /:quizId/result + mobile parsing; their
+      // meaning is repurposed to "assessment score" (percentage / raw points
+      // of the penalized, floored result). Standard mode keeps the exact
+      // pre-PRD21 formula (unweighted correctCount/totalQuestions) so a
+      // full-answer submission is byte-for-byte identical to today (G5);
+      // only penalty mode uses the weighted §5 formula (needed since wrong
+      // answers can subtract a non-integer amount from a weighted score).
+      const percentage = scoringMode === "penalty" ?
+        (maxScore > 0 ? Math.min(100, Math.max(0, Math.round((flooredScore / maxScore) * 100))) : 0) :
+        Math.round((correctCount / totalQuestions) * 100);
+
       const resultData = {
         userId: uid,
         courseId,
         quizId,
         answers,
-        score: Math.round((correctCount / totalQuestions) * 100),
+        score: percentage,
         correctCount,
         totalQuestions,
-        pointsAwarded,
+        pointsAwarded: flooredScore,
         submittedAt: FieldValue.serverTimestamp(),
       };
 
@@ -548,8 +581,8 @@ router.post(
         score: correctCount,
         total: totalQuestions,
         passed: correctCount === totalQuestions,
-        pointsAwarded,
-        earnedBadges, // Updated to pass the full badge objects
+        pointsAwarded: flooredScore,
+        earnedBadges,
         answers: answerSummary,
       }));
     } catch (err: unknown) {
